@@ -1,1 +1,1 @@
-"""min_agent: a from-scratch minimal agent runtime."""
+"""提供从零实现的最小 Agent 运行基础。"""

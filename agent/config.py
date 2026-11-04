@@ -1,4 +1,4 @@
-"""Configuration loaded from environment variables (.env supported)."""
+"""从环境变量和 .env 文件读取并校验配置。"""
 from __future__ import annotations
 
 import os
@@ -9,10 +9,11 @@ from dotenv import load_dotenv
 
 
 class ConfigError(Exception):
-    """Raised when configuration is missing or invalid."""
+    """表示必需配置缺失或配置值不合法。"""
 
 
 def _num(name: str, default: str, cast, minimum: float) -> float:
+    """读取数值配置，空值使用默认值，并校验类型和下限。"""
     raw = os.getenv(name, "").strip() or default
     try:
         value = cast(raw)
@@ -25,6 +26,8 @@ def _num(name: str, default: str, cast, minimum: float) -> float:
 
 @dataclass(frozen=True)
 class Settings:
+    """保存模型调用和工具所需的配置。"""
+
     api_key: str
     base_url: str | None
     model: str
@@ -34,7 +37,7 @@ class Settings:
 
     @classmethod
     def from_env(cls, dotenv_path: str | os.PathLike | None = None) -> "Settings":
-        """Load settings. `.env` is read from `dotenv_path`, default `./.env` (cwd)."""
+        """加载并校验配置，默认读取当前目录的 .env，保留已有环境变量。"""
         load_dotenv(dotenv_path or Path.cwd() / ".env", override=False)
         api_key = os.getenv("LLM_API_KEY", "").strip()
         model = os.getenv("LLM_MODEL", "").strip()
