@@ -10,3 +10,6 @@
 | LLM_TIMEOUT=abc �� ValueError������������ | δУ����ֵ���� | ͳһ�� ConfigError��timeout>0��retries>=0 |
 | choices=[] �� IndexError�����ַ������ɹ� | ��Ӧ��ȡ�޷��� | ���� `_extract`���쳣��Ӧͳһ�� LLMError |
 | ��ʵ API ������ȱ SOCKS �����ڿͻ��˳�ʼ��ʧ�� | ���������� socks �����httpx ��Ҫ socksio | ������Ϊ `httpx2[socks]` |
+| calculator �� eval ��ע����� | eval ��ִ��������� | �� ast �������ڵ���ֵ�����Ʊ��ʽ��������ָ�� |
+| ���� `True` ������ integer | bool �� int ���� | У��ʱ����ֵ������ʽ�ų� bool |
+| ʧ�����Կ����ظ���Ӵ��� | add ���ݵ� | ��ͬ���ݵ�δ��ɴ��츴��������Ŀ������ created=false |
