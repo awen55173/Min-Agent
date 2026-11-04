@@ -3,6 +3,7 @@ name = "min-agent"
 version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
+    "httpx2[socks]>=2.16.0",
     "openai>=3.45.0",
     "python-dotenv>=1.2.4",
 ]

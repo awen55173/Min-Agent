@@ -35,6 +35,16 @@ class OpenAIClient:
             max_retries=0,
         )
 
+    @staticmethod
+    def _extract(resp) -> str:
+        choices = getattr(resp, "choices", None)
+        if not choices:
+            raise LLMError("LLM response has no choices")
+        content = getattr(choices[0].message, "content", None)
+        if content is None or not str(content).strip():
+            raise LLMError("LLM returned empty content")
+        return content
+
     def chat(self, messages: list[Message]) -> str:
         last_err: Exception | None = None
         for attempt in range(self._max_retries + 1):
@@ -42,10 +52,7 @@ class OpenAIClient:
                 resp = self._client.chat.completions.create(
                     model=self._model, messages=messages, temperature=self._temperature
                 )
-                content = resp.choices[0].message.content
-                if content is None:
-                    raise LLMError("LLM returned empty content")
-                return content
+                return self._extract(resp)
             except (APIConnectionError, APITimeoutError, RateLimitError) as e:
                 last_err = e
             except APIStatusError as e:
