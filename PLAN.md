@@ -29,7 +29,7 @@ min_agent/
 ├─ README.md
 └─ docs/
    ├─ prompts.md          # AI Prompt 记录
-   └─ troubleshooting.md  # 问题解决记录
+   └─ questions.md  # 问题解决记录
 ```
 
 ## 3. 主要功能与设计要点
@@ -130,7 +130,7 @@ while 预算充足(步数 / token / 重试次数):
 - Context：纯对话追问；带工具追问；**压缩后追问**；**压缩后仍能完成刚才那个待办**。
 - 失败与幂等：API 失败后重试不重复添加待办；失败时已完成操作被保存。
 - Trace：**完整性**检查（调用/结果成对、步数连续、异常终止有记录）。
-- 真实 API 测试：标记 `@pytest.mark.live`，默认跳过；**交付前必须至少实际运行一次核心流程**（真实 LLM + 工具 + 追问），并把结果记入 README 或 troubleshooting。
+- 真实 API 测试：标记 `@pytest.mark.live`，默认跳过；**交付前必须至少实际运行一次核心流程**（真实 LLM + 工具 + 追问），并把结果记入 README 或 questions。
 
 ## 6. 后续完善方向
 - 原生 function calling 作为备选路径；异步/并行工具调用。
@@ -140,4 +140,4 @@ while 预算充足(步数 / token / 重试次数):
 ## 7. 交付物清单
 - GitHub 代码仓库。
 - README：运行方式、系统设计、memory 召回时机与放置方式（历史 → messages，摘要 → system 之后，状态 → 工具实时读取）。
-- `docs/prompts.md`（AI Prompt 记录）与 `docs/troubleshooting.md`（问题解决记录），两者分开。
+- `docs/prompts.md`（AI Prompt 记录）与 `docs/questions.md`（问题解决记录），两者分开。
