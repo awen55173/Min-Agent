@@ -24,16 +24,27 @@ class TodoItem:
 
 
 class TodoStore:
-    """内存待办存储（M3 接入会话持久化）。每个会话独立自增 ID。"""
+    """内存待办存储（M3 接入会话持久化，M5 支持调用记录缓存与状态回滚）。每个会话独立自增 ID。"""
 
     def __init__(self) -> None:
         """初始化空存储与锁。"""
         self._data: dict[tuple[str, str], dict] = {}
+        self._calls: dict[tuple[str, str], list[dict]] = {}
         self._lock = threading.Lock()
 
     def _bucket(self, ctx: ToolContext) -> dict:
         """获取（必要时创建）当前用户会话的数据桶。"""
         return self._data.setdefault((ctx.user_id, ctx.session_id), {"next": 1, "items": []})
+
+    def get_call_records(self, ctx: ToolContext) -> list[dict]:
+        """获取当前会话在内存中的工具调用记录列表引用。"""
+        with self._lock:
+            return self._calls.setdefault((ctx.user_id, ctx.session_id), [])
+
+    def set_call_records(self, ctx: ToolContext, records: list[dict]) -> None:
+        """设置当前会话在内存中的工具调用记录列表。"""
+        with self._lock:
+            self._calls[(ctx.user_id, ctx.session_id)] = [dict(r) for r in records]
 
     def export_state(self, ctx: ToolContext) -> dict:
         """导出当前会话的待办状态（next 与 items），用于持久化。"""
@@ -117,7 +128,7 @@ def make_todo_tool(store: TodoStore) -> Tool:
             return {action: fn(ctx, args["id"]).public()}
         raise ToolError(f"unknown action '{action}'")  # 正常情况下已被 enum 校验拦截
 
-    return Tool(
+    tool = Tool(
         name="todo",
         description=(
             "Manage the user's todo list. Actions: add (needs text), list (optional status), "
@@ -135,3 +146,5 @@ def make_todo_tool(store: TodoStore) -> Tool:
         },
         func=run,
     )
+    tool.store = store  # type: ignore[attr-defined]
+    return tool

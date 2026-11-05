@@ -64,7 +64,7 @@ def _empty_todos() -> dict:
 
 @dataclass
 class SessionData:
-    """会话持久化数据：历史、结构化摘要、待办、下一条待办 ID、轮次计数与版本号。"""
+    """会话持久化数据：历史、结构化摘要、待办、工具调用记录、未完成轮次、轮次计数与版本号。"""
 
     user_id: str
     session_id: str
@@ -75,13 +75,20 @@ class SessionData:
     created_at: str = field(default_factory=_now)
     updated_at: str = field(default_factory=_now)
     summary: str = ""
+    tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    unfinished_turn: dict[str, Any] | None = None
+
+    def unfinished_calls(self) -> list[dict[str, Any]]:
+        """返回会话中状态为 pending 或 interrupted 的未完成工具调用记录。"""
+        return [c for c in self.tool_calls if c.get("status") in ("pending", "interrupted")]
 
     def to_dict(self) -> dict[str, Any]:
         """转为可写入 JSON 的字典。"""
         return {
             "user_id": self.user_id, "session_id": self.session_id, "version": self.version,
             "next_turn": self.next_turn, "history": self.history, "todos": self.todos,
-            "summary": self.summary,
+            "summary": self.summary, "tool_calls": self.tool_calls,
+            "unfinished_turn": self.unfinished_turn,
             "created_at": self.created_at, "updated_at": self.updated_at,
         }
 
@@ -110,6 +117,43 @@ def _validate_todos(todos: Any) -> dict:
     return todos
 
 
+_CALL_STATUSES = {"pending", "ok", "error", "interrupted"}
+
+
+def _validate_tool_calls(tool_calls: Any) -> list[dict[str, Any]]:
+    """校验持久化的工具调用记录列表。"""
+    if not isinstance(tool_calls, list):
+        raise SessionCorruptError("invalid 'tool_calls'")
+    out: list[dict[str, Any]] = []
+    for c in tool_calls:
+        ok = (
+            isinstance(c, dict)
+            and isinstance(c.get("call_id"), str) and bool(c["call_id"])
+            and isinstance(c.get("tool"), str) and bool(c["tool"])
+            and isinstance(c.get("args"), dict)
+            and c.get("status") in _CALL_STATUSES
+            and isinstance(c.get("result", ""), str)
+        )
+        if not ok:
+            raise SessionCorruptError(f"invalid tool_call record: {c!r}")
+        out.append(dict(c))
+    return out
+
+
+def _validate_unfinished_turn(unfinished: Any) -> dict[str, Any] | None:
+    """校验未完成轮次信息（None 或含 turn_id 与 status 的字典）。"""
+    if unfinished is None:
+        return None
+    if not isinstance(unfinished, dict):
+        raise SessionCorruptError("invalid 'unfinished_turn'")
+    tid = unfinished.get("turn_id")
+    if not (_is_int(tid) or (isinstance(tid, str) and bool(tid))):
+        raise SessionCorruptError("invalid 'unfinished_turn.turn_id'")
+    if not isinstance(unfinished.get("status"), str):
+        raise SessionCorruptError("invalid 'unfinished_turn.status'")
+    return dict(unfinished)
+
+
 def validate_session_dict(raw: Any, user_id: str, session_id: str) -> SessionData:
     """校验文件内容并转为 SessionData；标识须与路径一致，任何不符抛 SessionCorruptError。"""
     if not isinstance(raw, dict):
@@ -130,6 +174,8 @@ def validate_session_dict(raw: Any, user_id: str, session_id: str) -> SessionDat
     summary = raw.get("summary", "")
     if not isinstance(summary, str):
         raise SessionCorruptError("invalid 'summary'")
+    tool_calls = _validate_tool_calls(raw.get("tool_calls", []))
+    unfinished_turn = _validate_unfinished_turn(raw.get("unfinished_turn", None))
     for key in ("created_at", "updated_at"):
         if not isinstance(raw.get(key), str):
             raise SessionCorruptError(f"invalid '{key}'")
@@ -137,6 +183,7 @@ def validate_session_dict(raw: Any, user_id: str, session_id: str) -> SessionDat
         user_id, session_id, raw["version"], raw["next_turn"],
         [{"role": m["role"], "content": m["content"]} for m in history],
         todos, raw["created_at"], raw["updated_at"], summary,
+        tool_calls, unfinished_turn,
     )
 
 

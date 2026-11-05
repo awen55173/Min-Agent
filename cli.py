@@ -1,7 +1,8 @@
-"""命令行入口：支持用户、会话（新建/按 ID 恢复/列出）与交互模式。"""
+"""命令行入口：支持用户、会话（新建/按 ID 恢复/列出）、Trace 查看与交互模式。"""
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 import re
 import sys
 
@@ -13,8 +14,9 @@ from agent.parser import ParseError, extract_json
 from agent.service import ChatService
 from agent.session import SessionError, SessionManager
 from agent.tools import ToolRegistry, build_registry
+from agent.trace import TraceLogger
 
-_OBS_RE = re.compile(r"^Observation \(tool=([^,]+), status=(ok|error)\): (.*)$", re.S)
+_OBS_RE = re.compile(r"^Observation \(tool=([^,]+), status=(ok|error|interrupted)\): (.*)$", re.S)
 
 
 def run_once(client: LLMClient, prompt: str, registry: ToolRegistry | None = None) -> AgentResult:
@@ -68,7 +70,9 @@ def _build_parser() -> argparse.ArgumentParser:
     group.add_argument("-s", "--session", help="按 ID 恢复已有会话")
     group.add_argument("--new", action="store_true", help="新建会话（未指定 --session 时的默认行为）")
     p.add_argument("--list", action="store_true", help="列出该用户的会话 ID 后退出")
+    p.add_argument("--trace", action="store_true", help="查看指定会话的 Trace 执行日志后退出")
     p.add_argument("--data-dir", default="data", help="会话存储目录（默认 data）")
+    p.add_argument("--trace-dir", default=None, help="Trace 日志目录（默认 <data-dir>/traces）")
     p.add_argument("--max-context-tokens", type=int, default=DEFAULT_CONTEXT_TOKENS,
                    help=f"每次模型请求的估算上下文 token 上限（默认 {DEFAULT_CONTEXT_TOKENS}）")
     p.add_argument("-v", "--verbose", action="store_true", help="打印工具调用过程")
@@ -82,10 +86,22 @@ def main(argv: list[str] | None = None) -> int:
     if args.max_context_tokens <= 0:
         parser.error("--max-context-tokens must be positive")
     manager = SessionManager(args.data_dir)
+    trace_root = Path(args.trace_dir) if args.trace_dir else Path(args.data_dir) / "traces"
+    trace_logger = TraceLogger(trace_root)
     try:
         if args.list:
             for sid in manager.list_sessions(args.user):
                 print(sid)
+            return 0
+        if args.trace:
+            if not args.session:
+                print("error: --trace requires -s/--session", file=sys.stderr)
+                return 1
+            events = trace_logger.read_events(args.user, args.session)
+            if not events and not manager.exists(args.user, args.session):
+                print(f"error: session '{args.session}' of user '{args.user}' does not exist", file=sys.stderr)
+                return 1
+            print(trace_logger.format_trace(args.user, args.session))
             return 0
         settings = Settings.from_env()
         resume = args.session is not None
@@ -97,6 +113,7 @@ def main(argv: list[str] | None = None) -> int:
             OpenAIClient(settings), manager,
             lambda store: build_registry(settings.tavily_api_key, todo_store=store),
             max_context_tokens=args.max_context_tokens,
+            trace_logger=trace_logger,
         )
         print(f"[session] user={args.user} id={session_id}", file=sys.stderr)
         create = not resume  # 新会话在首轮保存时落盘

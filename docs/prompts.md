@@ -18,3 +18,5 @@
 12. 修复 M3 评审指出的问题：活跃会话锁增加心跳保活、守卫串行回收与保存前归属校验；中断退出时保存本轮已执行的工具调用与 observation 历史；解析器拒绝包含多个顶层 JSON 对象的歧义输出。
 13. 完善 parser.py（仅接受完整的顶层 JSON 对象或完整代码块，拦截 JSON 数组、残缺外层 JSON 和深层嵌套输入并转为 ParseError）；实施 M4 上下文管理与结构化压缩（context.py、SessionData.summary 持久化、剥离历史 thought、按轮数与 token 预算压缩、压缩后完成待办测试与完整历史回放隔离）。
 14. 修复评审发现的三个问题：隔离非法工具输出和伪造 Observation，防止零执行后声称成功；增加上下文默认预算并对每次模型请求实施硬上限，限制摘要和工具结果，超限时明确结束；在压缩前提取输入末尾的预算、城市和偏好等字段。要求遵循 task_list.md、PLAN.md，补充回归测试、真实 API 验收、问题记录并创建 Git commit。
+15. 向用户解释 `agent/context.py` 中摘要预算计算（`summary_cap`）、`agent/service.py` 中 `prefix_len = len(ctx_plan.messages) - 1` 的作用，以及会话摘要的持久化机制。
+16. 实施 M5 阶段内容：为工具调用增加 `call_id`（关联用户、会话与 `turn_id`）并持久化工具名、参数、执行状态与结果；待办写操作（`add`/`complete`/`delete`）立即将待办状态与成功调用记录在同一原子保存中落盘；恢复或重试时复用原调用标识实现幂等（不确定状态先核对存储，保留同轮去重并允许跨轮创建同名待办）；统一异常退出说明并新增 `agent/trace.py`（JSONL Trace 日志与 CLI `--trace` 查看）；补充全量与真实 API 测试。

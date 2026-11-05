@@ -19,21 +19,24 @@ uv run python cli.py -u alice -s session_id "我有哪些待办？"
 uv run python cli.py -u alice
 # 列出用户的会话
 uv run python cli.py -u alice --list
+# 查看指定会话的 JSONL Trace 执行日志
+uv run python cli.py -u alice -s session_id --trace
 # 根据模型容量调整每次请求的估算上下文上限（默认 16000）
 uv run python cli.py --max-context-tokens 24000 -u alice
 ```
-会话数据保存在 `data/{user_id}/{session_id}.json`（可用 `--data-dir` 修改）；`-v` 打印工具调用过程。
+会话数据保存在 `data/{user_id}/{session_id}.json`（可用 `--data-dir` 修改），Trace 日志保存在 `data/traces/{user_id}/{session_id}.jsonl`（可用 `--trace-dir` 修改）；`-v` 打印工具调用过程。
 请在项目根目录运行（`.env` 从当前目录读取）。
 
 ## 会话与存储
-- 每个会话一个 JSON，保存完整历史（不含 system 提示词，供交互式回放）、结构化摘要（`summary`）、待办及下一条待办 ID、轮次计数、版本号。
+- 每个会话一个 JSON，保存完整历史（不含 system 提示词，供交互式回放）、结构化摘要（`summary`）、待办及下一条待办 ID、工具调用记录（`tool_calls`）、未完成轮次状态（`unfinished_turn`）、轮次计数、版本号。
 - 写入：临时文件 → flush + fsync → `os.replace` 原子替换；读写前后校验标识与内容，损坏文件不会被覆盖。
+- 写操作立即落盘与幂等恢复：待办写操作（`add`/`complete`/`delete`）成功后立即触发原子保存，将最新待办状态与成功调用记录（含 `call_id`、`user_id`、`session_id`、`turn_id`、参数、状态及结果）在同一事务中落盘，不等整轮结束。若后续模型请求失败或进程中断，恢复重试时自动复用未完成轮次的 `turn_id` 与 `call_id`：已成功的写操作直接返回已有结果，状态不确定（`pending`/`interrupted`）时先与 `TodoStore` 核对，避免重复写入；轮次正常完成后下一轮可正常创建同名待办。
 - 并发：`ChatService.send` 在“加载—执行—保存”全程持有会话锁（进程内锁 + 锁文件）；持有期间后台心跳定期刷新锁文件 `mtime`，防止长耗时调用被误判过期；
   拿不到锁等待至超时（默认 10s）后报“会话正被占用”；锁文件心跳停止超过 `stale_after`（默认 60s）才视为崩溃遗留并在守卫下回收；保存前再校验锁归属与磁盘版本，不一致则拒绝写入。
-- 失败退出（步数耗尽、解析失败、API 失败、内部错误、Ctrl+C）也会保存历史（含已完成的工具调用与 observation）及待办操作。
+- 失败退出与 Trace：统一处理正常结束与各类异常终止（`max_steps`、`parse_retries_exhausted`、`llm_error`、`internal_error`、`interrupted`、`tool_not_executed`、`context_limit`、`persist_error`），返回已完成操作与未完成说明；`agent/trace.py` 以 JSONL 格式记录每轮开始、工具请求/结果、耗时、错误及终止原因，并可识别中断遗留的未完成调用。
 
-## 上下文管理与压缩（M4）
-- 每次调用 `Agent.run()` 前由 `agent/context.py` 的 `build_context()` 构建发送给模型的有限上下文：`[系统提示词, (可选)结构化摘要, 最近 N 轮对话原文(剥离历史 thought), 本轮输入]`。
+## 上下文管理与压缩
+- 每次调用 `Agent.run()` 前由 `agent/context.py` 的 `build_context()` 构建发送给模型的有限上下文：`[系统提示词, (可选)结构化摘要, 最近 N 轮对话原文(剥离历史 thought; 工具调用名、参数,最终答案,工具输出都保留), 本轮输入]`。
 - 触发压缩条件：历史轮数超过 `max_history_turns`（默认 6），或估算 token 数超过 `max_context_tokens - reserved_tokens`（默认 16000 - 4000，为本轮工具调用与结果预留空间）。摘要默认限制为 2000 估算 tokens，包含待办的条数和文本长度限制；省略条目时提示通过 `todo.list` 查询完整实时状态。
 - 每次模型调用（包括连续工具调用、格式纠正）发送前检查硬上限；无法容纳时返回 `context_limit` 并保存已执行操作，提示缩短输入或分批处理。系统提示和本轮输入不会被静默截断。此上限使用项目估算器，不等同于模型 tokenizer 的精确计数。
 - 非法模型输出不会进入有效历史；纠错明确提示“本次工具未执行”。若模型随后直接声称已完成，返回 `tool_not_executed`，必须重新合法执行工具后才能正常结束。

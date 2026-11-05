@@ -40,6 +40,9 @@
 | 非法工具调用夹带自行编造的 Observation 被拒绝后，模型直接称待办添加成功，系统返回 ok | 原始非法输出先进入上下文；纠错没有说明零执行；最终答案只校验格式 | 解析通过后才保存 assistant 消息；拒绝模型额外的结果字段；纠错明确“本次工具未执行”；未重新成功执行工具即给最终答案时返回 `tool_not_executed`，拒绝将虚假成功答复持久化为事实。回放、多顶层对象、伪造字段和恢复执行均加入回归 |
 | 大量待办使摘要自身超预算；连续工具结果使后续模型请求超限 | 摘要中的待办没有条数/长度限制；最后一次压缩无条件放行；循环仅在首轮构建上下文 | 默认上下文从 4000 提高至 16000、预留从 1200 提高至 4000、摘要从 600 提高至 2000 估算 tokens；CLI 增加 `--max-context-tokens`。摘要限制条数/文本长度并提示读取完整 todo；每条 Observation 限制为 2000 估算 tokens；每次请求发送前统一校验硬上限，放不下时返回 `context_limit` 并保存历史和已执行操作。系统提示、本轮输入不被静默截断 |
 | 长输入或长回答末尾的“预算 8732 元、苏州、素食”压缩后丢失 | 普通对话事实只保留用户输入和回答的固定前缀 | 从全文先提取金额、数值、地点和偏好短字段，再对目标和普通文本做长度控制；长文本保留首尾；回归覆盖末尾事实和摘要重载 |
+| 添加待办后第二次模型请求失败或进程硬中断，恢复重试时可能重复创建待办或丢失已执行的写操作 | 之前仅在整轮 `ChatService.send` 结束时才调用 `session.save()`，且每次 `send` 都无条件自增 `turn_id`，导致失败轮次重试时 `turn_id` 变化、无法关联同轮已成功的写操作 | 新增确定性 `call_id`（关联 `user_id`、`session_id`、`turn_id`、工具名与规范化参数）与 `SessionData.tool_calls` / `unfinished_turn`；待办 `add`/`complete`/`delete` 成功后通过 `on_step_change` 立即将最新 `todos` 与 `tool_calls` 在同一原子保存中落盘；未完成轮次恢复重试时复用原 `turn_id` 与 `call_id`，已成功调用直接返回结果（`created=false`），`pending`/`interrupted` 状态先通过 `reconcile_todo_call` 与 `TodoStore` 核对，轮次正常完成后清空 `unfinished_turn` 以允许新轮次创建同名待办 |
+| 写操作立即落盘时若发生磁盘写入异常（`OSError`），内存中的 `TodoStore` 与磁盘状态可能不一致 | 工具先修改了内存 `TodoStore`，随后 `session.save()` 抛异常 | 在执行待办写操作前保存 `prev_todos` 快照，若立即落盘失败则回滚 `TodoStore` 与会话内存数据、移除未落盘消息，将调用记录标为 `error` 并以 `persist_error` 状态安全退出，保留此前已落盘的步骤 |
+| 异常退出或中断时缺乏统一结构化追踪，难以定位未完成调用 | 仅有终端 `-v` 打印，未持久化调用耗时、错误与请求/结果配对关系 | 新增 `agent/trace.py`（`TraceLogger`、`verify_trace_integrity`、`find_unfinished_calls`），按会话写入 JSONL 事件（`turn_start`/`tool_request`/`tool_result`/`parse_error`/`turn_end`），接入 `cli.py --trace` 查看 |
 
 ## 2026-11-05 评审修复验收
 
