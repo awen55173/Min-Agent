@@ -6,6 +6,9 @@
 3. 按 M0 阶段实施：venv + uv 环境管理，补全缺失文件，配置环境变量，封装 OpenAI 格式模型客户端，提供最小运行入口验证调用链路；统一问题记录文件为 docs/questions.md。
 
 4. 对 M0 阶段内容进行检查、测试和验证。
-5. ʵʩ M1�����߽ӿ���ע�ᡢcalculator / todo�����Ự���룩/ search(Tavily) / weather(wttr.in)�����������ա�
-6. M1 �����޸������߽�����л��쳣����������ֵ��Χ������ȥ�ظ�Ϊͬ�֡���ȫ����ģ�����ķ���˵������չ��鷶Χ��
-7. ʵʩ M2��prompt.py / parser.py / loop.py�����������ڵ� ReAct ѭ����CLI ���룬FakeLLM ����ʵ API ���ա�
+5. 实施 M1：工具接口与注册、calculator / todo（按会话隔离）/ search(Tavily) / weather(wttr.in)，并测试验收。
+6. M1 评审修复：工具结果序列化异常、计算器数值范围、待办去重改为同轮、补全工具模块中文方法说明并扩展检查范围。
+7. 实施 M2：prompt.py / parser.py / loop.py，单次请求内的 ReAct 循环，CLI 接入，FakeLLM 与真实 API 验收。
+
+## 2026-11-05
+8. 修复 docs 下记录文件的乱码：统一使用 UTF-8 写入，并重写被破坏的条目。
