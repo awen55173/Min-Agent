@@ -30,3 +30,5 @@
 | 跨进程加锁需兼容 Windows | `fcntl` 不可用 | 用 `O_CREAT|O_EXCL` 独占创建锁文件；锁内记录 token，释放时校验持有者；锁文件 mtime 超过 `stale_after`（默认 600s，应大于单轮最长耗时）视为过期并原子改名摘除；该回收为尽力而为，最终由版本校验兜底 |
 | 轮次 ID 需要跨重启唯一 | 之前使用随机 uuid，无法与会话恢复衔接 | 会话文件保存 `next_turn`，`Session.next_turn_id()` 在锁内分配并随会话保存 |
 | PowerShell 命令行里的中文参数在传给 Python 时可能乱码 | Windows 控制台/参数编码 | 涉及中文的验收放进 UTF-8 测试文件（含 live 测试）执行，不靠命令行传中文 |
+| 模型调用 weather 工具时传入中文城市名（如“北京”）导致 wttr.in 连接失败 | 工具描述与参数说明仅写了 `city name, e.g. Beijing`，未明确要求优先使用英文/拼音 | 在 `weather` 工具描述与 `city` 参数说明中明确要求优先使用英文或拼音城市名（先将中文城市名转换为英文如 `Beijing`） |
+| 交互模式恢复已有会话（`-s`）时终端只接受新输入，看不到之前的旧对话 | `cli.py` 恢复会话后直接进入 `input("you> ")` 循环，未读取并渲染历史消息 | 新增 `_print_history`，在交互模式恢复会话时回放历史中的用户提问（`you> ...`）与最终回复（`final_answer`），过滤中间 `Observation`/`Format error`，并在开启 `-v` 时将历史工具调用步骤输出到 `stderr` |

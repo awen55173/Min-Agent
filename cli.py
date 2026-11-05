@@ -2,14 +2,18 @@
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 
 from agent.config import ConfigError, Settings
 from agent.llm import LLMClient, OpenAIClient
 from agent.loop import OK, Agent, AgentResult
+from agent.parser import ParseError, extract_json
 from agent.service import ChatService
 from agent.session import SessionError, SessionManager
 from agent.tools import ToolRegistry, build_registry
+
+_OBS_RE = re.compile(r"^Observation \(tool=([^,]+), status=(ok|error)\): (.*)$", re.S)
 
 
 def run_once(client: LLMClient, prompt: str, registry: ToolRegistry | None = None) -> AgentResult:
@@ -23,6 +27,35 @@ def _print_result(result: AgentResult, verbose: bool) -> None:
         for a in result.actions:
             print(f"[step {a.step}] {a.tool}({a.args}) ok={a.ok} -> {a.result}", file=sys.stderr)
     print(result.answer)
+
+
+def _print_history(history: list[dict[str, str]], verbose: bool) -> None:
+    """回放会话历史中的用户提问与最终回复；verbose 时把历史工具调用输出到 stderr。"""
+    step = 0
+    pending_args: dict = {}
+    for msg in history:
+        role, content = msg.get("role"), msg.get("content", "")
+        if role == "user":
+            m = _OBS_RE.match(content)
+            if m:
+                if verbose:
+                    step += 1
+                    tool, status, res = m.group(1), m.group(2), m.group(3)
+                    print(f"[step {step}] {tool}({pending_args}) ok={status == 'ok'} -> {res}", file=sys.stderr)
+                continue
+            if content.startswith("Format error: "):
+                continue
+            step = 0
+            print(f"you> {content}")
+        elif role == "assistant":
+            try:
+                obj = extract_json(content)
+            except ParseError:
+                continue
+            if isinstance(obj.get("action"), str):
+                pending_args = obj.get("action_input") if isinstance(obj.get("action_input"), dict) else {}
+            elif isinstance(obj.get("final_answer"), str) and obj["final_answer"].strip():
+                print(obj["final_answer"].strip())
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -64,6 +97,9 @@ def main(argv: list[str] | None = None) -> int:
             result = service.send(args.user, session_id, args.prompt, create=create)
             _print_result(result, args.verbose)
             return 0 if result.status == OK else 1
+        if resume:
+            with manager.open(args.user, session_id) as session:
+                _print_history(session.data.history, args.verbose)
         while True:  # 交互模式：空行 / exit / quit / EOF 结束
             try:
                 line = input("you> ").strip()

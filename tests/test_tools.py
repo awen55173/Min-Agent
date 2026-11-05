@@ -181,6 +181,13 @@ def test_shared_store_across_registries():
 
 
 # ---- weather ----
+def test_weather_schema_prefers_english_city(reg):
+    tool = reg.get("weather")
+    city_desc = tool.parameters["properties"]["city"]["description"]
+    assert "English" in tool.description and "Beijing" in tool.description
+    assert "English" in city_desc and "Beijing" in city_desc
+
+
 def test_weather_ok(reg):
     ok, r = run(reg, "weather", {"city": "Beijing"})
     assert ok and r == {"city": "Beijing", "temp_c": "20", "feels_like_c": "19",

@@ -275,6 +275,39 @@ def test_cli_interactive_mode(cli_env, monkeypatch, capsys):
     assert len(state(cli_env, "dave", sid).history) == 4
 
 
+def test_cli_interactive_resume_replays_history_and_verbose_steps(cli_env, monkeypatch, capsys):
+    # 第一轮（含工具调用）创建会话
+    monkeypatch.setattr(cli, "OpenAIClient", lambda s: FakeLLM([act("todo", action="add", text="buy milk"), final("已添加待办")]))
+    assert cli.main(["-u", "eve", "帮我记买牛奶"]) == 0
+    sid = capsys.readouterr().err.split("id=")[1].split()[0]
+
+    # 单次命令模式恢复会话：不回放旧历史，保持输出干净
+    monkeypatch.setattr(cli, "OpenAIClient", lambda s: FakeLLM([final("单次回复")]))
+    assert cli.main(["-u", "eve", "-s", sid, "第二问"]) == 0
+    single_out = capsys.readouterr()
+    assert "you> 帮我记买牛奶" not in single_out.out
+    assert "已添加待办" not in single_out.out
+    assert single_out.out.strip() == "单次回复"
+
+    # 交互模式恢复会话（不带 -v）：回放用户提问与最终回答，不显示工具步骤和 Observation
+    monkeypatch.setattr(cli, "OpenAIClient", lambda s: FakeLLM([final("交互新回复")]))
+    lines = iter(["第三问", "exit"])
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(lines))
+    assert cli.main(["-u", "eve", "-s", sid]) == 0
+    resumed = capsys.readouterr()
+    assert "you> 帮我记买牛奶\n已添加待办\nyou> 第二问\n单次回复\n交互新回复\n" == resumed.out
+    assert "Observation" not in resumed.out
+    assert "[step 1]" not in resumed.err
+
+    # 交互模式恢复会话（带 -v）：额外在 stderr 回放历史工具步骤
+    monkeypatch.setattr(cli, "OpenAIClient", lambda s: FakeLLM([]))
+    monkeypatch.setattr("builtins.input", lambda prompt="": "exit")
+    assert cli.main(["-u", "eve", "-s", sid, "-v"]) == 0
+    resumed_v = capsys.readouterr()
+    assert "you> 帮我记买牛奶\n已添加待办" in resumed_v.out
+    assert "[step 1] todo({'action': 'add', 'text': 'buy milk'}) ok=True ->" in resumed_v.err
+
+
 # ---------- live ----------
 @pytest.mark.live
 def test_live_two_windows_recoverable(tmp_path):

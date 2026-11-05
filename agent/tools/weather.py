@@ -49,10 +49,21 @@ def make_weather_tool(http_get: HttpGet = _default_get) -> Tool:
 
     return Tool(
         name="weather",
-        description="Get current weather (temperature, feels-like, humidity, description) for a city.",
+        description=(
+            "Get current weather (temperature, feels-like, humidity, description) for a city. "
+            "Prefer English or Pinyin city names (e.g. 'Beijing' instead of '北京')."
+        ),
         parameters={
             "type": "object",
-            "properties": {"city": {"type": "string", "description": "city name, e.g. Beijing"}},
+            "properties": {
+                "city": {
+                    "type": "string",
+                    "description": (
+                        "city name in English or Pinyin "
+                        "(prefer English, translate Chinese city names first, e.g. 'Beijing' instead of '北京')"
+                    ),
+                }
+            },
             "required": ["city"],
         },
         func=run,
