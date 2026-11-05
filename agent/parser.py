@@ -2,13 +2,11 @@
 from __future__ import annotations
 
 import json
-import re
 from dataclasses import dataclass, field
 from typing import Any
 
 from .tools.registry import ToolError, ToolRegistry, validate_args
 
-_FENCE = re.compile(r"```(?:json|JSON)?\s*(.*?)```", re.S)
 
 
 class ParseError(Exception):
@@ -36,27 +34,45 @@ def _loads_object(text: str) -> dict | None:
 
 
 def extract_json(text: str) -> dict:
-    """依次尝试：整段 JSON、代码块 JSON、文本中第一个可解析的 JSON 对象；都失败抛 ParseError。"""
+    """提取输出中唯一的 JSON 对象（整段、代码块或夹在文字中均可）。
+
+    找不到抛 ParseError；出现多个顶层 JSON 对象时视为歧义输出，同样抛 ParseError，不取其中任何一个。
+    """
     text = text.strip()
     if not text:
         raise ParseError("empty output; reply with a single JSON object")
     obj = _loads_object(text)
     if obj is not None:
         return obj
-    for block in _FENCE.findall(text):
-        obj = _loads_object(block.strip())
-        if obj is not None:
-            return obj
+    found = _scan_objects(text)
+    if len(found) == 1:
+        return found[0]
+    if len(found) > 1:
+        raise ParseError(
+            f"ambiguous output: found {len(found)} JSON objects; reply with exactly ONE JSON object "
+            "(one tool call or one final_answer)"
+        )
+    raise ParseError("output is not valid JSON; reply with a single JSON object in the required format")
+
+
+def _scan_objects(text: str) -> list[dict]:
+    """扫描文本中所有顶层 JSON 对象（已解析对象的内部不再重复扫描）。"""
     decoder = json.JSONDecoder()
-    for i, ch in enumerate(text):
-        if ch == "{":
+    found: list[dict] = []
+    i = 0
+    while i < len(text):
+        if text[i] == "{":
             try:
-                obj, _ = decoder.raw_decode(text[i:])
+                obj, end = decoder.raw_decode(text, i)
             except ValueError:
+                i += 1
                 continue
             if isinstance(obj, dict):
-                return obj
-    raise ParseError("output is not valid JSON; reply with a single JSON object in the required format")
+                found.append(obj)
+            i = end
+            continue
+        i += 1
+    return found
 
 
 def _present(value: Any) -> bool:

@@ -32,3 +32,6 @@
 | PowerShell 命令行里的中文参数在传给 Python 时可能乱码 | Windows 控制台/参数编码 | 涉及中文的验收放进 UTF-8 测试文件（含 live 测试）执行，不靠命令行传中文 |
 | 模型调用 weather 工具时传入中文城市名（如“北京”）导致 wttr.in 连接失败 | 工具描述与参数说明仅写了 `city name, e.g. Beijing`，未明确要求优先使用英文/拼音 | 在 `weather` 工具描述与 `city` 参数说明中明确要求优先使用英文或拼音城市名（先将中文城市名转换为英文如 `Beijing`） |
 | 交互模式恢复已有会话（`-s`）时终端只接受新输入，看不到之前的旧对话 | `cli.py` 恢复会话后直接进入 `input("you> ")` 循环，未读取并渲染历史消息 | 新增 `_print_history`，在交互模式恢复会话时回放历史中的用户提问（`you> ...`）与最终回复（`final_answer`），过滤中间 `Observation`/`Format error`，并在开启 `-v` 时将历史工具调用步骤输出到 `stderr` |
+| 活跃会话的锁在长耗时调用超过 `stale_after` 时可能被误回收，并留下 `.stale-*` 残留文件 | 仅凭锁文件初始 `mtime` 判断过期，持锁期间未刷新；回收用改名且缺乏互斥 | `_FileLock` 持锁期间启动后台心跳线程定期刷新 `mtime`；只有心跳停止超过 `stale_after`（默认 60s）才在 `.reclaim` 守卫下复核并删除过期锁；`Session.save` 保存前校验锁归属（`check_lock`），失去锁则抛 `LockLostError` 拒绝覆盖 |
+| `KeyboardInterrupt` 中断后只保存了用户输入和中断提示，已执行的工具调用与 observation 丢失 | `ChatService.send` 在 `BaseException` 分支未从 `Agent.run` 获取本轮已发生的消息 | `Agent.run` 捕获 `BaseException` 时整理本轮消息（正在执行的工具补写 `status=interrupted` 的 observation，尚未执行的模型输出丢弃）并挂载到 `e.agent_result`；`ChatService.send` 将其连同中断说明完整写入会话历史 |
+| 模型一次返回连续两个 JSON 对象时，解析器静默提取第一个并执行工具 | `extract_json` 使用 `raw_decode` 找到第一个 JSON 对象即返回 | 新增 `_scan_objects` 扫描全部顶层 JSON 对象，发现数量大于 1 时抛 `ParseError("ambiguous output...")`，不执行任何工具并回填错误让模型重试 |

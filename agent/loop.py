@@ -14,6 +14,7 @@ MAX_STEPS = "max_steps"
 PARSE_EXHAUSTED = "parse_retries_exhausted"
 LLM_FAILED = "llm_error"
 INTERNAL_ERROR = "internal_error"
+INTERRUPTED = "interrupted"
 
 _OBS_MAX = 2000  # 单条 observation 的最大字符数
 
@@ -58,6 +59,7 @@ class Agent:
         self._registry = registry
         self._max_steps = max_steps
         self._max_parse_retries = max_parse_retries
+        self._pending: str | None = None  # 正在执行的工具名
 
     def run(
         self,
@@ -85,11 +87,29 @@ class Agent:
             return self._loop(messages, ctx, actions, finish)
         except Exception as e:  # 未预期异常：保留已完成的操作与消息，交给调用方持久化
             return finish(INTERNAL_ERROR, f"内部错误：{type(e).__name__}: {e}\n{_summarize(actions)}")
+        except BaseException as e:  # Ctrl+C 等中断：整理出一致的部分结果挂到异常上，再继续抛出
+            e.agent_result = self._interrupted(finish, messages, actions)  # type: ignore[attr-defined]
+            raise
+
+    def _interrupted(self, finish, messages: list[Message], actions: list[ActionRecord]) -> AgentResult:
+        """把被中断的消息整理成一致状态：执行中的工具补一条中断 observation，未执行的模型输出丢弃。"""
+        pending = self._pending
+        if pending is not None:
+            messages.append({
+                "role": "user",
+                "content": f"Observation (tool={pending}, status=interrupted): the run was interrupted while this "
+                           "tool was executing; it may or may not have taken effect. Check the current state "
+                           "(e.g. list todos) before retrying.",
+            })
+        elif len(messages) > 1 and messages[-1]["role"] == "assistant":
+            messages.pop()  # 尚未执行的模型输出：丢弃，避免恢复后被误认为已执行
+        return finish(INTERRUPTED, f"本轮被中断。\n{_summarize(actions)}")
 
     def _loop(self, messages: list[Message], ctx: ToolContext, actions: list[ActionRecord], finish) -> AgentResult:
         """核心循环：调用 LLM、解析、执行工具并回填，直到得到最终答案或预算耗尽。"""
         parse_failures = 0
         while True:
+            self._pending = None
             try:
                 raw = self._llm.chat(messages)
             except LLMError as e:
@@ -111,6 +131,7 @@ class Agent:
 
             if len(actions) >= self._max_steps:
                 return finish(MAX_STEPS, f"已达最大步数（{self._max_steps}），任务可能未完成。\n{_summarize(actions)}")
+            self._pending = parsed.action  # 执行期间被中断时据此补写 observation
             result = self._registry.execute(parsed.action, parsed.action_input, ctx)
             actions.append(
                 ActionRecord(len(actions) + 1, parsed.thought, parsed.action, parsed.action_input, result.ok, result.content)
@@ -118,3 +139,4 @@ class Agent:
             status = "ok" if result.ok else "error"
             content = result.content if len(result.content) <= _OBS_MAX else result.content[:_OBS_MAX] + "...(truncated)"
             messages.append({"role": "user", "content": f"Observation (tool={parsed.action}, status={status}): {content}"})
+            self._pending = None

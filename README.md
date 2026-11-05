@@ -14,7 +14,7 @@ copy .env.example .env     # 填写 LLM_API_KEY / LLM_MODEL / LLM_BASE_URL / TAV
 # 默认新建独立会话并显示 ID（会话 ID 输出到 stderr）
 uv run python cli.py -u alice "查一下北京天气并记一条待办"
 # 按 ID 恢复会话继续聊
-uv run python cli.py -u alice -s <session_id> "我有哪些待办？"
+uv run python cli.py -u alice -s session_id "我有哪些待办？"
 # 不带输入进入交互模式（空行 / exit 退出）
 uv run python cli.py -u alice
 # 列出用户的会话
@@ -26,9 +26,9 @@ uv run python cli.py -u alice --list
 ## 会话与存储
 - 每个会话一个 JSON，保存历史（不含 system 提示词）、待办及下一条待办 ID、轮次计数、版本号。
 - 写入：临时文件 → flush + fsync → `os.replace` 原子替换；读写前后校验标识与内容，损坏文件不会被覆盖。
-- 并发：`ChatService.send` 在“加载—执行—保存”全程持有会话锁（进程内锁 + 锁文件）；拿不到锁等待至超时（默认 10s）后报“会话正被占用”；
-  锁文件 mtime 超过 600s 视为崩溃遗留并回收；保存前再校验磁盘版本，不一致则拒绝写入。
-- 失败退出（步数耗尽、解析失败、API 失败、内部错误、Ctrl+C）也会保存历史与已完成的待办操作。
+- 并发：`ChatService.send` 在“加载—执行—保存”全程持有会话锁（进程内锁 + 锁文件）；持有期间后台心跳定期刷新锁文件 `mtime`，防止长耗时调用被误判过期；
+  拿不到锁等待至超时（默认 10s）后报“会话正被占用”；锁文件心跳停止超过 `stale_after`（默认 60s）才视为崩溃遗留并在守卫下回收；保存前再校验锁归属与磁盘版本，不一致则拒绝写入。
+- 失败退出（步数耗尽、解析失败、API 失败、内部错误、Ctrl+C）也会保存历史（含已完成的工具调用与 observation）及待办操作。
 
 ## 测试
 ```powershell

@@ -37,7 +37,7 @@ class ChatService:
         """在会话内处理一轮输入并保存。
 
         锁覆盖加载—执行—保存；Agent 失败（预算耗尽、解析失败、API 失败、内部错误）时同样保存历史与
-        已完成的待办操作；进程被中断时也保存待办及用户输入，再把异常继续抛出。
+        已完成的待办操作；进程被中断时保存待办及本轮已发生的消息（含工具调用与 observation），再把异常继续抛出。
         """
         with self._manager.open(user_id, session_id, create=create) as session:
             data = session.data
@@ -49,21 +49,27 @@ class ChatService:
             turn_id = session.next_turn_id()
             try:
                 result = agent.run(text, user_id, session_id, turn_id, history)
-            except BaseException:
+            except BaseException as e:
+                partial: AgentResult | None = getattr(e, "agent_result", None)
+                if partial is not None:
+                    new_messages = partial.messages[1 + len(history):]
+                else:  # 尚未进入循环就被中断
+                    new_messages = [{"role": "user", "content": text}]
+                new_messages.append(_assistant_final(INTERRUPTED_NOTE))
+                data.history += new_messages
                 data.todos = store.export_state(ctx)
-                data.history += [
-                    {"role": "user", "content": text},
-                    {"role": "assistant", "content": json.dumps({"final_answer": INTERRUPTED_NOTE}, ensure_ascii=False)},
-                ]
                 session.save()
                 raise
             new_messages = result.messages[1 + len(history):]  # 去掉 system 与已有历史，只追加本轮新增
             if result.status != OK:
                 # 失败提示作为 assistant 回复入历史，保持对话轮次完整，模型后续追问能知道发生了什么
-                new_messages.append(
-                    {"role": "assistant", "content": json.dumps({"final_answer": result.answer}, ensure_ascii=False)}
-                )
+                new_messages.append(_assistant_final(result.answer))
             data.history += new_messages
             data.todos = store.export_state(ctx)
             session.save()
             return result
+
+
+def _assistant_final(text: str) -> dict[str, str]:
+    """构造一条以 final_answer 形式记录的 assistant 消息。"""
+    return {"role": "assistant", "content": json.dumps({"final_answer": text}, ensure_ascii=False)}

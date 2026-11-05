@@ -37,6 +37,10 @@ class SessionBusyError(SessionError):
     """会话正被其他窗口/进程占用，等待锁超时。"""
 
 
+class LockLostError(SessionError):
+    """持锁期间锁被回收或接管；为避免覆盖他人数据，拒绝保存。"""
+
+
 class VersionConflictError(SessionError):
     """保存时发现磁盘版本与加载时不一致（兜底的并发保护）。"""
 
@@ -131,36 +135,79 @@ def validate_session_dict(raw: Any, user_id: str, session_id: str) -> SessionDat
     )
 
 
+def _age(path: Path) -> float | None:
+    """返回文件距上次修改的秒数，文件不存在返回 None。"""
+    try:
+        return time.time() - path.stat().st_mtime
+    except FileNotFoundError:
+        return None
+
+
 class _FileLock:
-    """基于独占创建锁文件的跨进程锁；带超时、过期回收和持有者校验释放。"""
+    """基于独占创建锁文件的跨进程锁。
 
-    def __init__(self, path: Path, timeout: float, stale_after: float, poll: float = 0.05):
-        """记录锁文件路径、等待超时、过期时间（锁文件 mtime 超过该秒数视为持有者已崩溃）。"""
+    - 持有期间由后台心跳线程定期刷新锁文件 mtime，因此长时间运行的持有者不会被判为过期；
+    - 只有 mtime 超过 stale_after（心跳停止，即持有进程崩溃/被杀）才可回收；
+    - 回收经由 .reclaim 守卫文件串行化，并在守卫内复核过期，避免多个等待者互相删锁；
+    - 释放时校验 token，只删除自己的锁。
+    """
+
+    def __init__(self, path: Path, timeout: float, stale_after: float, poll: float = 0.05,
+                 heartbeat: float | None = None):
+        """记录锁路径、等待超时、过期阈值；心跳间隔默认为 stale_after 的 1/4。"""
         self._path, self._timeout, self._stale_after, self._poll = path, timeout, stale_after, poll
+        self._guard = path.with_name(path.name + ".reclaim")
+        self._heartbeat = heartbeat if heartbeat is not None else max(stale_after / 4, 0.01)
         self._token: str | None = None
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self.lost = False
 
-    def _is_stale(self) -> bool:
-        """锁文件是否已过期（文件消失视为未过期，交给下一轮重试）。"""
-        try:
-            return time.time() - self._path.stat().st_mtime > self._stale_after
-        except FileNotFoundError:
+    def _try_reclaim(self) -> bool:
+        """锁已过期时在守卫下复核并删除；成功删除（或锁已消失）返回 True。"""
+        age = _age(self._path)
+        if age is None:
+            return True
+        if age <= self._stale_after:
             return False
+        try:
+            fd = os.open(self._guard, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            guard_age = _age(self._guard)  # 回收者自身崩溃遗留的守卫
+            if guard_age is not None and guard_age > self._stale_after:
+                try:
+                    self._guard.unlink()
+                except OSError:
+                    pass
+            return False
+        os.close(fd)
+        try:
+            age = _age(self._path)  # 守卫内复核：期间可能已被他人回收并重新加锁
+            if age is None:
+                return True
+            if age <= self._stale_after:
+                return False
+            try:
+                self._path.unlink()
+            except FileNotFoundError:
+                pass
+            return True
+        finally:
+            try:
+                self._guard.unlink()
+            except OSError:
+                pass
 
     def acquire(self, deadline: float | None = None) -> None:
-        """获取锁；超过期限仍被占用则抛 SessionBusyError。"""
+        """获取锁并启动心跳；超过期限仍被占用则抛 SessionBusyError。"""
         deadline = deadline if deadline is not None else time.monotonic() + self._timeout
         token = uuid.uuid4().hex
         while True:
             try:
                 fd = os.open(self._path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             except FileExistsError:
-                if self._is_stale():
-                    # 原子改名摘除过期锁，再重试；尽力而为，最终由版本校验兜底
-                    try:
-                        os.replace(self._path, f"{self._path}.stale-{uuid.uuid4().hex}")
-                        continue
-                    except OSError:
-                        pass
+                if self._try_reclaim():
+                    continue
                 if time.monotonic() >= deadline:
                     raise SessionBusyError("session is in use by another window/process (lock timeout)") from None
                 time.sleep(self._poll)
@@ -168,29 +215,57 @@ class _FileLock:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump({"pid": os.getpid(), "token": token, "time": time.time()}, f)
             self._token = token
+            self._stop.clear()
+            self._thread = threading.Thread(target=self._beat, name=f"lock-heartbeat:{self._path.name}", daemon=True)
+            self._thread.start()
             return
 
+    def owned(self) -> bool:
+        """锁文件当前是否仍属于自己（未被回收或接管）。"""
+        if self._token is None or self.lost:
+            return False
+        try:
+            return json.loads(self._path.read_text(encoding="utf-8")).get("token") == self._token
+        except (OSError, ValueError, AttributeError):
+            return False
+
+    def _beat(self) -> None:
+        """心跳线程：定期刷新锁文件 mtime；发现锁已不属于自己则标记 lost 并退出。"""
+        while not self._stop.wait(self._heartbeat):
+            if not self.owned():
+                self.lost = True
+                return
+            try:
+                os.utime(self._path)
+            except OSError:
+                self.lost = True
+                return
+
     def release(self) -> None:
-        """释放锁：仅当锁文件仍属于自己（token 一致）时才删除，避免误删他人的锁。"""
+        """停止心跳并释放锁：仅当锁文件仍属于自己时才删除，避免误删他人的锁。"""
         if self._token is None:
             return
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join()
+            self._thread = None
         try:
-            owner = json.loads(self._path.read_text(encoding="utf-8")).get("token")
-            if owner == self._token:
+            if self.owned():
                 self._path.unlink()
-        except (OSError, ValueError):
+        except OSError:
             pass
         finally:
             self._token = None
 
 
 class Session:
-    """已加锁打开的会话句柄：持有 SessionData，保存时做版本校验与原子写入。"""
+    """已加锁打开的会话句柄：持有 SessionData，保存时做锁归属校验、版本校验与原子写入。"""
 
-    def __init__(self, manager: "SessionManager", data: SessionData):
-        """记录所属管理器、数据及加载时的版本号。"""
+    def __init__(self, manager: "SessionManager", data: SessionData, lock: _FileLock | None = None):
+        """记录所属管理器、数据、所持文件锁及加载时的版本号。"""
         self._manager = manager
         self.data = data
+        self._lock = lock
         self._loaded_version = data.version
 
     def next_turn_id(self) -> int:
@@ -199,16 +274,21 @@ class Session:
         self.data.next_turn += 1
         return turn
 
+    def check_lock(self) -> None:
+        """确认仍持有会话锁，否则抛 LockLostError。"""
+        if self._lock is not None and not self._lock.owned():
+            raise LockLostError("session lock was lost (taken over by another window/process); not saving")
+
     def save(self) -> None:
-        """保存会话：磁盘版本须等于加载版本，否则抛 VersionConflictError；成功后版本号加一。"""
+        """保存会话：须仍持有锁且磁盘版本等于加载版本，否则抛错；成功后版本号加一。"""
         self._manager._save(self)
 
 
 class SessionManager:
     """会话管理器：每个会话一个 JSON 文件，位于 root/{user_id}/{session_id}.json。"""
 
-    def __init__(self, root: str | os.PathLike, lock_timeout: float = 10.0, stale_after: float = 600.0):
-        """设置存储根目录、加锁等待超时（秒）及锁过期时间（秒，应大于单轮最长耗时）。"""
+    def __init__(self, root: str | os.PathLike, lock_timeout: float = 10.0, stale_after: float = 60.0):
+        """设置存储根目录、加锁等待超时（秒）及锁过期阈值（秒，心跳停止超过该时长才视为持有者崩溃）。"""
         self._root = Path(root)
         self._lock_timeout = lock_timeout
         self._stale_after = stale_after
@@ -278,7 +358,7 @@ class SessionManager:
                     if not create:
                         raise SessionNotFoundError(f"session '{session_id}' of user '{user_id}' does not exist")
                     data = SessionData(user_id, session_id)
-                yield Session(self, data)
+                yield Session(self, data, flock)
             finally:
                 flock.release()
         finally:
@@ -294,6 +374,7 @@ class SessionManager:
         d = session.data
         path = self._path(d.user_id, d.session_id)
         disk = self._disk_version(path, d.user_id, d.session_id)
+        session.check_lock()
         if disk != session._loaded_version:
             raise VersionConflictError(f"version conflict: loaded {session._loaded_version}, on disk {disk}")
         new_version = d.version + 1
@@ -305,6 +386,7 @@ class SessionManager:
                 json.dump(payload, f, ensure_ascii=False, indent=2)
                 f.flush()
                 os.fsync(f.fileno())
+            session.check_lock()  # 替换前再确认一次，缩小窗口
             os.replace(tmp, path)
         except BaseException:
             try:
