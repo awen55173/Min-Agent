@@ -13,6 +13,7 @@ OK = "ok"
 MAX_STEPS = "max_steps"
 PARSE_EXHAUSTED = "parse_retries_exhausted"
 LLM_FAILED = "llm_error"
+INTERNAL_ERROR = "internal_error"
 
 _OBS_MAX = 2000  # 单条 observation 的最大字符数
 
@@ -80,6 +81,13 @@ class Agent:
             """组装终止结果。"""
             return AgentResult(status, answer, actions, messages, turn_id)
 
+        try:
+            return self._loop(messages, ctx, actions, finish)
+        except Exception as e:  # 未预期异常：保留已完成的操作与消息，交给调用方持久化
+            return finish(INTERNAL_ERROR, f"内部错误：{type(e).__name__}: {e}\n{_summarize(actions)}")
+
+    def _loop(self, messages: list[Message], ctx: ToolContext, actions: list[ActionRecord], finish) -> AgentResult:
+        """核心循环：调用 LLM、解析、执行工具并回填，直到得到最终答案或预算耗尽。"""
         parse_failures = 0
         while True:
             try:

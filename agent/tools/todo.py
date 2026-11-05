@@ -35,6 +35,20 @@ class TodoStore:
         """获取（必要时创建）当前用户会话的数据桶。"""
         return self._data.setdefault((ctx.user_id, ctx.session_id), {"next": 1, "items": []})
 
+    def export_state(self, ctx: ToolContext) -> dict:
+        """导出当前会话的待办状态（next 与 items），用于持久化。"""
+        with self._lock:
+            b = self._bucket(ctx)
+            return {"next": b["next"], "items": [asdict(i) for i in b["items"]]}
+
+    def load_state(self, ctx: ToolContext, state: dict) -> None:
+        """用持久化状态覆盖当前会话的待办（恢复会话时调用）。"""
+        with self._lock:
+            self._data[(ctx.user_id, ctx.session_id)] = {
+                "next": state["next"],
+                "items": [TodoItem(i["id"], i["text"], i["done"], i.get("turn")) for i in state["items"]],
+            }
+
     def add(self, ctx: ToolContext, text: str) -> tuple[TodoItem, bool]:
         """新增待办；仅当同一轮（turn_id 相同且非 None）内已新增过相同内容的未完成待办时复用，返回 (条目, 是否新建)。"""
         text = text.strip()

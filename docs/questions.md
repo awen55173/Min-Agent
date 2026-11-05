@@ -24,3 +24,9 @@
 | docs 下记录文件出现乱码 | 用 PowerShell 的 `Add-Content` / `Set-Content` 写入中文：Windows PowerShell 5 默认非 UTF-8 编码，且命令行中的中文在传入时已被破坏，事后无法恢复 | 重写受损条目；以后只用 write_file（UTF-8）或 Python 以 `encoding="utf-8"` 写文档，不再用 PowerShell 写中文 |
 | 连续两次 run_once 复用注册表时，第二次明确新增的同名待办被合并；显式 turn_id=1 与自动生成冲突 | 轮次号是 Agent 实例内的自增计数，不同实例、重启后都会从 1 开始 | 自动生成 `new_turn_id()`（uuid，全局唯一）；显式传入的 ID 由调用方保证会话内唯一，M3 由会话管理器分配并持久化 |
 | 仅含空白的 final_answer 被当作成功，返回空答案 | 解析器只判断了空字符串，strip 在判断之后 | `_present` 对字符串先 strip 再判断，空白视为未提供，走格式纠正与重试流程 |
+| Agent 内部出现未预期异常时，本轮已完成的待办和历史会丢失 | `Agent.run` 未捕获异常，调用方拿不到 messages/actions | `run` 把未预期 `Exception` 转为 `internal_error` 结果；`ChatService` 对 `BaseException`（如 Ctrl+C）也保存待办与用户输入后再抛出 |
+| 失败结果（步数耗尽/解析耗尽/API 失败）存入历史后对话轮次不完整 | 失败时最后一条可能是 user 观察或非法 assistant 输出 | 失败提示以 `{"final_answer": ...}` 形式作为 assistant 回复入历史，后续追问可知晓发生了什么 |
+| 历史可能重复拼接系统提示词 | Agent 返回的 messages 含 system 与旧历史 | 历史只存 user/assistant；保存时仅取 `messages[1 + len(history):]` 的新增部分，system 每轮重新生成 |
+| 跨进程加锁需兼容 Windows | `fcntl` 不可用 | 用 `O_CREAT|O_EXCL` 独占创建锁文件；锁内记录 token，释放时校验持有者；锁文件 mtime 超过 `stale_after`（默认 600s，应大于单轮最长耗时）视为过期并原子改名摘除；该回收为尽力而为，最终由版本校验兜底 |
+| 轮次 ID 需要跨重启唯一 | 之前使用随机 uuid，无法与会话恢复衔接 | 会话文件保存 `next_turn`，`Session.next_turn_id()` 在锁内分配并随会话保存 |
+| PowerShell 命令行里的中文参数在传给 Python 时可能乱码 | Windows 控制台/参数编码 | 涉及中文的验收放进 UTF-8 测试文件（含 live 测试）执行，不靠命令行传中文 |
