@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import copy
 import json
-from typing import Callable
+import re
+from typing import Any, Callable
 
 from .context import (
     DEFAULT_CONTEXT_TOKENS,
@@ -23,6 +24,32 @@ from .trace import TraceLogger
 INTERRUPTED_NOTE = "（本轮被意外中断，未能给出回复；已完成的操作已保存。）"
 
 RegistryFactory = Callable[[TodoStore], ToolRegistry]
+
+_NEW_INTENT_RE = re.compile(
+    r"(另外|额外|再记|再加|再创建|再添加|再建|新增一条|多记|多加|第二条|新的一条|另一个|另一条|同名|重新创建一条|another|one\s+more|additional)",
+    re.I,
+)
+_RETRY_INTENT_RE = re.compile(
+    r"(继续|重试|接着|刚才|恢复|上次|未完成|retry|continue|resume)",
+    re.I,
+)
+
+
+def _is_retry_request(unfinished: dict[str, Any] | None, text: str, retry: bool | None = None) -> bool:
+    """判断本次输入是否为对上一轮未完成请求的恢复重试（与新建请求区分）。"""
+    if not isinstance(unfinished, dict) or not isinstance(unfinished.get("turn_id"), (int, str)):
+        return False
+    if retry is not None:
+        return bool(retry)
+    norm_text = " ".join(text.strip().split())
+    prev_prompt = " ".join(str(unfinished.get("prompt", "")).strip().split())
+    if norm_text and norm_text == prev_prompt:
+        return True
+    if _NEW_INTENT_RE.search(norm_text):
+        return False
+    if _RETRY_INTENT_RE.search(norm_text):
+        return True
+    return False
 
 
 class ChatService:
@@ -56,23 +83,36 @@ class ChatService:
         """返回关联的 TraceLogger 实例。"""
         return self._trace_logger
 
-    def send(self, user_id: str, session_id: str, text: str, create: bool = False) -> AgentResult:
+    def send(
+        self,
+        user_id: str,
+        session_id: str,
+        text: str,
+        create: bool = False,
+        retry: bool | None = None,
+    ) -> AgentResult:
         """在会话内处理一轮输入并保存。
 
-        - 若上一轮因进程崩溃遗留未闭合的 Observation，先补齐中断说明以保证历史结构完整；
-        - 若存在未完成轮次（unfinished_turn），恢复/重试时复用原 turn_id 与 call_id，实现写操作幂等；
+        - 明确区分恢复重试与新建请求：仅当恢复重试未完成轮次时复用原 turn_id 与 call_id，新请求分配新 turn_id；
         - 待办写操作（add/complete/delete）成功后立即将待办状态与成功调用记录在同一原子保存中落盘；
-        - 全程记录 JSONL Trace（含正常结束、模型失败、预算耗尽、保存失败及中断）。
+        - 收尾保存先于 turn_end 日志执行，若最终落盘失败则统一返回 persist_error 并记录真实失败状态。
         """
         with self._manager.open(user_id, session_id, create=create) as session:
             data = session.data
             if data.history and data.history[-1].get("role") == "user":
                 data.history.append(_assistant_final(INTERRUPTED_NOTE))
 
-            if data.unfinished_turn is not None and isinstance(data.unfinished_turn.get("turn_id"), (int, str)):
+            if _is_retry_request(data.unfinished_turn, text, retry=retry):
+                assert data.unfinished_turn is not None
                 turn_id = data.unfinished_turn["turn_id"]
+                prev_attempt = data.unfinished_turn.get("attempt", 1)
+                next_from_state = (prev_attempt + 1) if isinstance(prev_attempt, int) else 2
+                attempt_id = max(next_from_state, self._trace_logger.next_attempt_id(user_id, session_id, turn_id))
+                tracked_prompt = str(data.unfinished_turn.get("prompt") or text)
             else:
                 turn_id = session.next_turn_id()
+                attempt_id = self._trace_logger.next_attempt_id(user_id, session_id, turn_id)
+                tracked_prompt = text
 
             ctx = ToolContext(user_id, session_id, turn_id)
             store = TodoStore()
@@ -91,32 +131,61 @@ class ChatService:
                 )
             except ContextBudgetError as e:
                 ans = f"{e}\n本轮尚未执行任何工具操作。\n未完成说明：输入或固定上下文超出预算限制，未调用模型。"
-                ev_start = self._trace_logger.log_turn_start(user_id, session_id, turn_id, text)
-                ev_end = self._trace_logger.log_turn_end(
-                    user_id, session_id, turn_id, CONTEXT_LIMIT, ans, 0, 0.0, error=ans,
+                ev_start = self._trace_logger.log_turn_start(
+                    user_id, session_id, turn_id, text, attempt_id=attempt_id,
                 )
+                prev_history = list(data.history)
+                prev_unfinished = copy.deepcopy(data.unfinished_turn)
                 messages = [{"role": "user", "content": text}, _assistant_final(ans)]
                 data.history += messages
-                data.unfinished_turn = {"turn_id": turn_id, "prompt": text, "status": CONTEXT_LIMIT}
-                session.save()
+                data.unfinished_turn = {
+                    "turn_id": turn_id,
+                    "attempt": attempt_id,
+                    "prompt": tracked_prompt,
+                    "status": CONTEXT_LIMIT,
+                }
+                final_status = CONTEXT_LIMIT
+                try:
+                    session.save()
+                except (OSError, SessionError) as save_err:
+                    data.history = prev_history
+                    data.unfinished_turn = prev_unfinished
+                    final_status = PERSIST_FAILED
+                    ans = f"保存写操作失败：{save_err}\n本轮尚未执行任何工具操作。\n未完成说明：{e}；且会话状态未能落盘。"
+                ev_end = self._trace_logger.log_turn_end(
+                    user_id, session_id, turn_id, final_status, ans, 0, 0.0,
+                    error=ans, attempt_id=attempt_id,
+                )
                 return AgentResult(
-                    CONTEXT_LIMIT, ans, messages=messages, turn_id=turn_id, trace_events=[ev_start, ev_end],
+                    final_status, ans, messages=messages, turn_id=turn_id,
+                    trace_events=[ev_start, ev_end], attempt_id=attempt_id,
                 )
 
             data.summary = ctx_plan.summary
             base_history = list(data.history)
             prefix_len = len(ctx_plan.messages) - 1  # 本轮 user_input 之前的上下文消息数
-            data.unfinished_turn = {"turn_id": turn_id, "prompt": text, "status": "in_progress"}
+            data.unfinished_turn = {
+                "turn_id": turn_id,
+                "attempt": attempt_id,
+                "prompt": tracked_prompt,
+                "status": "in_progress",
+            }
 
             def on_step_change(cur_messages: list[Message], rec: dict, persist_now: bool) -> None:
                 """在工具状态变更时同步会话数据；待办写操作成功后立即原子保存待办状态与调用记录。"""
                 prev_history = list(data.history)
                 prev_todos = copy.deepcopy(data.todos)
                 prev_summary = data.summary
+                prev_unfinished = copy.deepcopy(data.unfinished_turn)
                 data.todos = store.export_state(ctx)
                 data.history = base_history + cur_messages[prefix_len:]
                 data.summary = refresh_summary_todos(data.summary, data.todos)
-                data.unfinished_turn = {"turn_id": turn_id, "prompt": text, "status": "in_progress"}
+                data.unfinished_turn = {
+                    "turn_id": turn_id,
+                    "attempt": attempt_id,
+                    "prompt": tracked_prompt,
+                    "status": "in_progress",
+                }
                 if persist_now:
                     try:
                         session.save()
@@ -124,7 +193,37 @@ class ChatService:
                         data.history = prev_history
                         data.todos = prev_todos
                         data.summary = prev_summary
+                        data.unfinished_turn = prev_unfinished
                         raise
+
+            def on_turn_end(status: str, answer: str, cur_messages: list[Message]) -> None:
+                """在记录 turn_end 日志前执行最终会话落盘；失败时恢复内存状态并向上抛出以转为 persist_error。"""
+                prev_history = list(data.history)
+                prev_todos = copy.deepcopy(data.todos)
+                prev_summary = data.summary
+                prev_unfinished = copy.deepcopy(data.unfinished_turn)
+                new_messages = list(cur_messages[prefix_len:])
+                if status != OK:
+                    new_messages.append(_assistant_final(answer))
+                    data.unfinished_turn = {
+                        "turn_id": turn_id,
+                        "attempt": attempt_id,
+                        "prompt": tracked_prompt,
+                        "status": status,
+                    }
+                else:
+                    data.unfinished_turn = None
+                data.history = base_history + new_messages
+                data.todos = store.export_state(ctx)
+                data.summary = refresh_summary_todos(data.summary, data.todos)
+                try:
+                    session.save()
+                except (OSError, SessionError):
+                    data.history = prev_history
+                    data.todos = prev_todos
+                    data.summary = prev_summary
+                    data.unfinished_turn = prev_unfinished
+                    raise
 
             agent = Agent(
                 self._llm,
@@ -144,7 +243,9 @@ class ChatService:
                     call_records=data.tool_calls,
                     todo_store=store,
                     on_step_change=on_step_change,
+                    on_turn_end=on_turn_end,
                     trace_logger=self._trace_logger,
+                    attempt_id=attempt_id,
                 )
             except BaseException as e:
                 partial: AgentResult | None = getattr(e, "agent_result", None)
@@ -156,27 +257,18 @@ class ChatService:
                 data.history = base_history + new_messages
                 data.todos = store.export_state(ctx)
                 data.summary = refresh_summary_todos(data.summary, data.todos)
-                data.unfinished_turn = {"turn_id": turn_id, "prompt": text, "status": INTERRUPTED}
-                session.save()
-                raise
-
-            new_messages = result.messages[prefix_len:]  # 只追加本轮新增的原始消息，保留完整历史
-            if result.status != OK:
-                # 失败提示作为 assistant 回复入历史，保持对话轮次完整，模型后续追问能知道发生了什么
-                new_messages.append(_assistant_final(result.answer))
-                data.unfinished_turn = {"turn_id": turn_id, "prompt": text, "status": result.status}
-            else:
-                data.unfinished_turn = None
-            data.history = base_history + new_messages
-            data.todos = store.export_state(ctx)
-            data.summary = refresh_summary_todos(data.summary, data.todos)
-            if result.status == PERSIST_FAILED:
+                data.unfinished_turn = {
+                    "turn_id": turn_id,
+                    "attempt": attempt_id,
+                    "prompt": tracked_prompt,
+                    "status": INTERRUPTED,
+                }
                 try:
                     session.save()
                 except (OSError, SessionError):
                     pass
-            else:
-                session.save()
+                raise
+
             return result
 
 

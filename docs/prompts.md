@@ -20,3 +20,4 @@
 14. 修复评审发现的三个问题：隔离非法工具输出和伪造 Observation，防止零执行后声称成功；增加上下文默认预算并对每次模型请求实施硬上限，限制摘要和工具结果，超限时明确结束；在压缩前提取输入末尾的预算、城市和偏好等字段。要求遵循 task_list.md、PLAN.md，补充回归测试、真实 API 验收、问题记录并创建 Git commit。
 15. 向用户解释 `agent/context.py` 中摘要预算计算（`summary_cap`）、`agent/service.py` 中 `prefix_len = len(ctx_plan.messages) - 1` 的作用，以及会话摘要的持久化机制。
 16. 实施 M5 阶段内容：为工具调用增加 `call_id`（关联用户、会话与 `turn_id`）并持久化工具名、参数、执行状态与结果；待办写操作（`add`/`complete`/`delete`）立即将待办状态与成功调用记录在同一原子保存中落盘；恢复或重试时复用原调用标识实现幂等（不确定状态先核对存储，保留同轮去重并允许跨轮创建同名待办）；统一异常退出说明并新增 `agent/trace.py`（JSONL Trace 日志与 CLI `--trace` 查看）；补充全量与真实 API 测试。
+17. 修复 M5 补充验证发现的 3 项缺口：区分未完成轮次的“恢复重试”与“新建请求”（仅重试复用原 `turn_id` 与 `call_id`，要求另外创建同名待办等新请求分配新 `turn_id`）；将整轮收尾保存置于 `turn_end` 日志记录之前，最终保存失败时统一返回 `persist_error` 并记录真实日志状态；新增 `attempt_id` 区分同一 `turn_id` 下的每次尝试，保持稳定 `call_id` 幂等并按 `(turn_id, attempt_id)` 校验 Trace 配对与连续步数。

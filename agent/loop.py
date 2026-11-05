@@ -66,6 +66,7 @@ class AgentResult:
     messages: list[Message] = field(default_factory=list)
     turn_id: TurnId | None = None
     trace_events: list[dict[str, Any]] = field(default_factory=list)
+    attempt_id: int | str = 1
 
 
 def _summarize(actions: list[ActionRecord], unfinished: str = "") -> str:
@@ -138,9 +139,11 @@ class Agent:
         call_records: list[dict[str, Any]] | None = None,
         todo_store: TodoStore | None = None,
         on_step_change: Callable[[list[Message], dict[str, Any], bool], None] | None = None,
+        on_turn_end: Callable[[str, str, list[Message]], None] | None = None,
         trace_logger: TraceLogger | None = None,
+        attempt_id: int | str | None = None,
     ) -> AgentResult:
-        """处理一次用户输入并返回结果；支持按 call_id 幂等复用、写操作即时落盘与 Trace 日志。"""
+        """处理一次用户输入并返回结果；支持按 call_id 幂等复用、写操作即时落盘与带 attempt_id 的 Trace 日志。"""
         if turn_id is None:
             turn_id = new_turn_id()
         ctx = ToolContext(user_id, session_id, turn_id)
@@ -152,6 +155,12 @@ class Agent:
         else:
             records = []
         logger = trace_logger if trace_logger is not None else self._trace_logger
+        if attempt_id is not None:
+            attempt = attempt_id
+        elif logger is not None:
+            attempt = logger.next_attempt_id(user_id, session_id, turn_id)
+        else:
+            attempt = 1
 
         if context_messages is not None:
             messages: list[Message] = [dict(m) for m in context_messages]
@@ -169,30 +178,45 @@ class Agent:
         def emit_start() -> None:
             """记录单轮开始 Trace 事件。"""
             if logger is not None:
-                ev = logger.log_turn_start(user_id, session_id, turn_id, user_input)
+                ev = logger.log_turn_start(user_id, session_id, turn_id, user_input, attempt_id=attempt)
             else:
                 ev = {
                     "event": "turn_start",
                     "user_id": user_id,
                     "session_id": session_id,
                     "turn_id": turn_id,
+                    "attempt_id": attempt,
                     "step": 0,
                     "user_input": user_input,
                 }
             trace_events.append(ev)
 
         def finish(status: str, answer: str) -> AgentResult:
-            """记录单轮终止 Trace 事件并组装 AgentResult。"""
+            """先执行收尾持久化钩子，再记录单轮终止 Trace 事件并组装 AgentResult。"""
+            if on_turn_end is not None and status != INTERRUPTED:
+                try:
+                    on_turn_end(status, answer, messages)
+                except (OSError, SessionError) as e:
+                    if status != PERSIST_FAILED:
+                        status = PERSIST_FAILED
+                        answer = (
+                            f"保存写操作失败：{e}\n"
+                            f"{_summarize(actions, '最终会话状态未能落盘，此前已落盘的写操作已保留。')}"
+                        )
             dur_ms = round((time.perf_counter() - turn_t0) * 1000, 3)
             err = None if status == OK else answer
             if logger is not None:
-                ev = logger.log_turn_end(user_id, session_id, turn_id, status, answer, len(actions), dur_ms, error=err)
+                ev = logger.log_turn_end(
+                    user_id, session_id, turn_id, status, answer, len(actions), dur_ms,
+                    error=err, attempt_id=attempt,
+                )
             else:
                 ev = {
                     "event": "turn_end",
                     "user_id": user_id,
                     "session_id": session_id,
                     "turn_id": turn_id,
+                    "attempt_id": attempt,
                     "status": status,
                     "answer": answer,
                     "steps": len(actions),
@@ -200,18 +224,20 @@ class Agent:
                     "error": err,
                 }
             trace_events.append(ev)
-            return AgentResult(status, answer, actions, messages, turn_id, trace_events)
+            return AgentResult(status, answer, actions, messages, turn_id, trace_events, attempt)
 
         emit_start()
         try:
-            return self._loop(messages, ctx, actions, records, store, on_step_change, logger, trace_events, finish)
+            return self._loop(
+                messages, ctx, actions, records, store, on_step_change, logger, trace_events, attempt, finish,
+            )
         except Exception as e:  # 未预期异常：保留已完成的操作与消息，交给调用方持久化
             return finish(
                 INTERNAL_ERROR,
                 f"内部错误：{type(e).__name__}: {e}\n{_summarize(actions, '运行期发生未预期异常，后续步骤未完成。')}",
             )
         except BaseException as e:  # Ctrl+C 等中断：整理出一致的部分结果挂到异常上，再继续抛出
-            e.agent_result = self._interrupted(finish, messages, actions, ctx, logger, trace_events)  # type: ignore[attr-defined]
+            e.agent_result = self._interrupted(finish, messages, actions, ctx, logger, trace_events, attempt)  # type: ignore[attr-defined]
             raise
 
     def _interrupted(
@@ -222,6 +248,7 @@ class Agent:
         ctx: ToolContext,
         logger: TraceLogger | None,
         trace_events: list[dict[str, Any]],
+        attempt: int | str,
     ) -> AgentResult:
         """把被中断的消息与调用记录整理成一致状态：执行中的工具补写中断 observation 与 Trace 结果。"""
         pending = self._pending
@@ -239,7 +266,7 @@ class Agent:
                     ev = logger.log_tool_result(
                         ctx.user_id, ctx.session_id, ctx.turn_id or "", step, cid,
                         "", pending, args, False, "interrupted", "", 0.0,
-                        error="interrupted during tool execution",
+                        error="interrupted during tool execution", attempt_id=attempt,
                     )
                 else:
                     ev = {
@@ -247,6 +274,7 @@ class Agent:
                         "user_id": ctx.user_id,
                         "session_id": ctx.session_id,
                         "turn_id": ctx.turn_id,
+                        "attempt_id": attempt,
                         "step": step,
                         "call_id": cid,
                         "thought": "",
@@ -280,6 +308,7 @@ class Agent:
         on_step_change: Callable[[list[Message], dict[str, Any], bool], None] | None,
         logger: TraceLogger | None,
         trace_events: list[dict[str, Any]],
+        attempt: int | str,
         finish,
     ) -> AgentResult:
         """核心循环：调用 LLM、解析、执行工具（或幂等复用）并回填，直到得到最终答案或预算耗尽。"""
@@ -312,13 +341,16 @@ class Agent:
                 )
                 parse_failures += 1
                 if logger is not None:
-                    ev = logger.log_parse_error(ctx.user_id, ctx.session_id, turn_id, len(actions) + 1, str(e))
+                    ev = logger.log_parse_error(
+                        ctx.user_id, ctx.session_id, turn_id, len(actions) + 1, str(e), attempt_id=attempt,
+                    )
                 else:
                     ev = {
                         "event": "parse_error",
                         "user_id": ctx.user_id,
                         "session_id": ctx.session_id,
                         "turn_id": turn_id,
+                        "attempt_id": attempt,
                         "step": len(actions) + 1,
                         "error": str(e),
                     }
@@ -369,7 +401,7 @@ class Agent:
             if logger is not None:
                 req_ev = logger.log_tool_request(
                     ctx.user_id, ctx.session_id, turn_id, step, call_id,
-                    parsed.thought, parsed.action, parsed.action_input,
+                    parsed.thought, parsed.action, parsed.action_input, attempt_id=attempt,
                 )
             else:
                 req_ev = {
@@ -377,6 +409,7 @@ class Agent:
                     "user_id": ctx.user_id,
                     "session_id": ctx.session_id,
                     "turn_id": turn_id,
+                    "attempt_id": attempt,
                     "step": step,
                     "call_id": call_id,
                     "thought": parsed.thought,
@@ -483,7 +516,8 @@ class Agent:
                             res_ev = logger.log_tool_result(
                                 ctx.user_id, ctx.session_id, turn_id, step, call_id,
                                 parsed.thought, parsed.action, parsed.action_input,
-                                False, "error", result_content, duration_ms, error=err_msg,
+                                False, "error", result_content, duration_ms,
+                                error=err_msg, attempt_id=attempt,
                             )
                         else:
                             res_ev = {
@@ -491,6 +525,7 @@ class Agent:
                                 "user_id": ctx.user_id,
                                 "session_id": ctx.session_id,
                                 "turn_id": turn_id,
+                                "attempt_id": attempt,
                                 "step": step,
                                 "call_id": call_id,
                                 "thought": parsed.thought,
@@ -523,7 +558,7 @@ class Agent:
                     ctx.user_id, ctx.session_id, turn_id, step, call_id,
                     parsed.thought, parsed.action, parsed.action_input,
                     result_ok, status_str, result_content, duration_ms,
-                    error=err_str, reused=reused,
+                    error=err_str, reused=reused, attempt_id=attempt,
                 )
             else:
                 res_ev = {
@@ -531,6 +566,7 @@ class Agent:
                     "user_id": ctx.user_id,
                     "session_id": ctx.session_id,
                     "turn_id": turn_id,
+                    "attempt_id": attempt,
                     "step": step,
                     "call_id": call_id,
                     "thought": parsed.thought,

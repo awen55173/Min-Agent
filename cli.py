@@ -71,6 +71,7 @@ def _build_parser() -> argparse.ArgumentParser:
     group.add_argument("--new", action="store_true", help="新建会话（未指定 --session 时的默认行为）")
     p.add_argument("--list", action="store_true", help="列出该用户的会话 ID 后退出")
     p.add_argument("--trace", action="store_true", help="查看指定会话的 Trace 执行日志后退出")
+    p.add_argument("--retry", action="store_true", help="显式作为上一轮未完成请求的恢复重试执行")
     p.add_argument("--data-dir", default="data", help="会话存储目录（默认 data）")
     p.add_argument("--trace-dir", default=None, help="Trace 日志目录（默认 <data-dir>/traces）")
     p.add_argument("--max-context-tokens", type=int, default=DEFAULT_CONTEXT_TOKENS,
@@ -118,7 +119,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[session] user={args.user} id={session_id}", file=sys.stderr)
         create = not resume  # 新会话在首轮保存时落盘
         if args.prompt is not None:
-            result = service.send(args.user, session_id, args.prompt, create=create)
+            result = service.send(
+                args.user, session_id, args.prompt, create=create, retry=True if args.retry else None,
+            )
             _print_result(result, args.verbose)
             return 0 if result.status == OK else 1
         if resume:

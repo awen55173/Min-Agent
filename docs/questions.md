@@ -43,6 +43,9 @@
 | 添加待办后第二次模型请求失败或进程硬中断，恢复重试时可能重复创建待办或丢失已执行的写操作 | 之前仅在整轮 `ChatService.send` 结束时才调用 `session.save()`，且每次 `send` 都无条件自增 `turn_id`，导致失败轮次重试时 `turn_id` 变化、无法关联同轮已成功的写操作 | 新增确定性 `call_id`（关联 `user_id`、`session_id`、`turn_id`、工具名与规范化参数）与 `SessionData.tool_calls` / `unfinished_turn`；待办 `add`/`complete`/`delete` 成功后通过 `on_step_change` 立即将最新 `todos` 与 `tool_calls` 在同一原子保存中落盘；未完成轮次恢复重试时复用原 `turn_id` 与 `call_id`，已成功调用直接返回结果（`created=false`），`pending`/`interrupted` 状态先通过 `reconcile_todo_call` 与 `TodoStore` 核对，轮次正常完成后清空 `unfinished_turn` 以允许新轮次创建同名待办 |
 | 写操作立即落盘时若发生磁盘写入异常（`OSError`），内存中的 `TodoStore` 与磁盘状态可能不一致 | 工具先修改了内存 `TodoStore`，随后 `session.save()` 抛异常 | 在执行待办写操作前保存 `prev_todos` 快照，若立即落盘失败则回滚 `TodoStore` 与会话内存数据、移除未落盘消息，将调用记录标为 `error` 并以 `persist_error` 状态安全退出，保留此前已落盘的步骤 |
 | 异常退出或中断时缺乏统一结构化追踪，难以定位未完成调用 | 仅有终端 `-v` 打印，未持久化调用耗时、错误与请求/结果配对关系 | 新增 `agent/trace.py`（`TraceLogger`、`verify_trace_integrity`、`find_unfinished_calls`），按会话写入 JSONL 事件（`turn_start`/`tool_request`/`tool_result`/`parse_error`/`turn_end`），接入 `cli.py --trace` 查看 |
+| 失败后的新请求（如用户明确要求“另外再创建一条同名待办”）被误判为旧请求重试，导致被去重 | 只要存在 `unfinished_turn`，下一次输入就无条件复用旧 `turn_id`，未区分恢复重试与新建请求 | 新增 `_is_retry_request`（及可选 `retry` 参数）：仅当输入与原未完成请求相同或包含继续/重试意图且不含“另外/再创建/新增一条”等新建意图时才复用原 `turn_id`，否则作为新请求分配新 `turn_id` |
+| 写操作即时保存成功后，若整轮结束时最终保存失败，`OSError` 直接抛出且 Trace 已提前记录 `turn_end=ok` | `Agent.run` 在 `finish()` 中先写 `turn_end` 日志，返回后 `ChatService.send` 才执行最终 `session.save()` 且未捕获 `OSError` | 新增 `on_turn_end` 钩子并在 `finish()` 记录 `turn_end` 前执行最终落盘；若落盘失败则回滚未落盘内存变更、统一转为 `persist_error` 状态并写入 `turn_end(status="persist_error")`，保留此前已即时保存的操作 |
+| 正常恢复重试后，Trace 完整性检查返回 `valid=False` | 重试复用了同一个 `turn_id`，但新一次尝试的工具步数重新从 1 开始（如 `[1, 1]`），而原校验按 `turn_id` 汇总所有步数 | 为 Trace 事件增加 `attempt_id` 区分同一 `turn_id` 下的每次尝试，保持 `call_id` 跨尝试稳定用于幂等，并在 `verify_trace_integrity` 中按 `(turn_id, attempt_id)` 校验请求/结果配对、步数从 1 连续递增与终止事件 |
 
 ## 2026-11-05 评审修复验收
 

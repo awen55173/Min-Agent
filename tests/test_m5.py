@@ -269,6 +269,114 @@ def test_add_todo_then_llm_fails_resume_does_not_duplicate_and_next_turn_can_add
         assert [it["text"] for it in items] == ["买牛奶", "买牛奶"]
 
 
+def test_new_request_after_failed_turn_is_not_mistaken_for_retry(tmp_path: Path):
+    """回归 P1-1：添加待办后模型失败，若下一次输入是新建请求（如“另外再创建一条同名待办”），不得误判为重试去重。"""
+    llm = ScriptedLLM([
+        # 第 1 轮：添加“买牛奶”成功（#1），随后第二次模型调用失败，留下 unfinished_turn
+        _act("todo", action="add", text="买牛奶"),
+        LLMError("503 upstream timeout"),
+        # 第 2 轮：用户未选择重试旧请求，而是明确要求“另外再创建一条同名待办：买牛奶”
+        _act("todo", action="add", text="买牛奶"),
+        _fin("已为您另外创建第二条同名待办：买牛奶（#2）"),
+    ])
+    mgr, svc, trace = _make_service(tmp_path, llm)
+
+    r1 = svc.send("u1", "s_new_after_fail", "帮我记个待办：买牛奶", create=True)
+    assert r1.status == LLM_FAILED
+
+    r2 = svc.send("u1", "s_new_after_fail", "另外再创建一条同名待办：买牛奶")
+    assert r2.status == OK
+    assert r2.turn_id != r1.turn_id  # 识别为新请求，分配新 turn_id
+    assert r2.actions[0].call_id != r1.actions[0].call_id
+    assert r2.actions[0].reused is False
+    assert '"created": true' in r2.actions[0].result
+
+    with mgr.open("u1", "s_new_after_fail") as s:
+        items = s.data.todos["items"]
+        assert len(items) == 2
+        assert [it["id"] for it in items] == [1, 2]
+        assert [it["text"] for it in items] == ["买牛奶", "买牛奶"]
+    assert verify_trace_integrity(trace.read_events("u1", "s_new_after_fail"))["valid"] is True
+
+
+def test_final_save_failure_returns_persist_error_and_logs_accurate_trace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """回归 P1-2：写操作即时保存成功后，若整轮结束时最终保存失败，统一返回 persist_error，且 Trace 记录 persist_error 而非 ok。"""
+    llm = ScriptedLLM([
+        _act("todo", action="add", text="即时落盘已成功"),
+        _fin("原本准备正常返回的回复"),
+    ])
+    mgr, svc, trace = _make_service(tmp_path, llm)
+
+    real_replace = os.replace
+    replace_count = 0
+
+    def fail_on_final_save(src, dst):
+        """第 1 次替换（写操作即时保存）成功，第 2 次替换（整轮收尾保存）抛 OSError。"""
+        nonlocal replace_count
+        replace_count += 1
+        if replace_count == 2:
+            raise OSError("simulated disk error on final turn save")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", fail_on_final_save)
+    res = svc.send("u1", "final_save_fail", "记一条待办", create=True)
+    assert res.status == PERSIST_FAILED
+    assert "保存写操作失败" in res.answer
+    assert "即时落盘已成功" in res.answer
+    assert "未完成说明" in res.answer
+
+    # 恢复 os.replace 检查磁盘：即时保存的待办完好保留，unfinished_turn 仍为 in_progress
+    monkeypatch.setattr(os, "replace", real_replace)
+    with mgr.open("u1", "final_save_fail") as s:
+        assert s.data.version == 1
+        assert [it["text"] for it in s.data.todos["items"]] == ["即时落盘已成功"]
+        assert s.data.unfinished_turn is not None
+        assert s.data.unfinished_turn["status"] == "in_progress"
+
+    # 检查 Trace：turn_end 必须反映真实的 persist_error 状态，绝不能提前记为 ok
+    events = trace.read_events("u1", "final_save_fail")
+    turn_ends = [e for e in events if e.get("event") == "turn_end"]
+    assert len(turn_ends) == 1
+    assert turn_ends[0]["status"] == PERSIST_FAILED
+    assert turn_ends[0]["error"]
+    assert verify_trace_integrity(events)["valid"] is True
+
+
+def test_trace_integrity_passes_after_retry_recovery_with_attempt_id(tmp_path: Path):
+    """回归 P2-3：正常恢复重试复用原 turn_id 与稳定 call_id，并通过 attempt_id 区分每次尝试，Trace 完整性检查通过。"""
+    llm = ScriptedLLM([
+        # 第 1 次尝试（attempt_id=1）：step 1 添加待办后模型报错
+        _act("todo", action="add", text="买牛奶"),
+        LLMError("temporary failure"),
+        # 第 2 次尝试（attempt_id=2，复用同一个 turn_id）：step 1 幂等复用待办，step 2 计算器，然后完成
+        _act("todo", action="add", text="买牛奶"),
+        _act("calculator", expression="10 + 20"),
+        _fin("恢复执行完毕"),
+    ])
+    _, svc, trace = _make_service(tmp_path, llm)
+
+    r1 = svc.send("u1", "retry_trace", "记买牛奶并算 10+20", create=True)
+    assert r1.status == LLM_FAILED
+    assert r1.attempt_id == 1
+
+    r2 = svc.send("u1", "retry_trace", "继续刚才未完成的请求")
+    assert r2.status == OK
+    assert r2.turn_id == r1.turn_id
+    assert r2.attempt_id == 2
+    assert r2.actions[0].call_id == r1.actions[0].call_id
+    assert r2.actions[0].reused is True
+
+    events = trace.read_events("u1", "retry_trace")
+    report = verify_trace_integrity(events)
+    assert report["valid"] is True
+    assert report["paired"] is True
+    assert report["contiguous_steps"] is True
+    assert report["valid_ends"] is True
+    assert report["unfinished_calls"] == []
+
+
 def test_hard_crash_right_after_write_save_recovers_on_restart(tmp_path: Path):
     """重点验收 2：写操作立即保存后进程硬中断（未走收尾保存），重启后仍能恢复待办状态与执行结果。"""
     session_file = tmp_path / "sessions" / "u1" / "crash.json"

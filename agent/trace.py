@@ -178,13 +178,30 @@ class TraceLogger:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
             f.flush()
 
-    def log_turn_start(self, user_id: str, session_id: str, turn_id: TurnId, user_input: str) -> dict[str, Any]:
-        """记录单轮请求开始事件。"""
+    def next_attempt_id(self, user_id: str, session_id: str, turn_id: TurnId) -> int:
+        """计算某轮次（turn_id）的下一次尝试序号（attempt_id，从 1 开始递增）。"""
+        count = sum(
+            1
+            for ev in self.read_events(user_id, session_id)
+            if ev.get("event") == "turn_start" and ev.get("turn_id") == turn_id
+        )
+        return count + 1
+
+    def log_turn_start(
+        self,
+        user_id: str,
+        session_id: str,
+        turn_id: TurnId,
+        user_input: str,
+        attempt_id: int | str = 1,
+    ) -> dict[str, Any]:
+        """记录单轮请求开始事件（含 attempt_id 区分同轮重试）。"""
         ev = {
             "event": "turn_start",
             "user_id": user_id,
             "session_id": session_id,
             "turn_id": turn_id,
+            "attempt_id": attempt_id,
             "step": 0,
             "user_input": user_input,
         }
@@ -201,6 +218,7 @@ class TraceLogger:
         thought: str,
         tool: str,
         args: dict[str, Any],
+        attempt_id: int | str = 1,
     ) -> dict[str, Any]:
         """在工具执行前记录工具调用请求事件。"""
         ev = {
@@ -208,6 +226,7 @@ class TraceLogger:
             "user_id": user_id,
             "session_id": session_id,
             "turn_id": turn_id,
+            "attempt_id": attempt_id,
             "step": step,
             "call_id": call_id,
             "thought": thought,
@@ -234,13 +253,15 @@ class TraceLogger:
         duration_ms: float,
         error: str | None = None,
         reused: bool = False,
+        attempt_id: int | str = 1,
     ) -> dict[str, Any]:
-        """在工具执行后（或复用/中断时）记录工具结果事件，与 tool_request 成对。"""
+        """在工具执行后（或复用/中断时）记录工具结果事件，与同次尝试的 tool_request 成对。"""
         ev = {
             "event": "tool_result",
             "user_id": user_id,
             "session_id": session_id,
             "turn_id": turn_id,
+            "attempt_id": attempt_id,
             "step": step,
             "call_id": call_id,
             "thought": thought,
@@ -263,6 +284,7 @@ class TraceLogger:
         turn_id: TurnId,
         step: int,
         error: str,
+        attempt_id: int | str = 1,
     ) -> dict[str, Any]:
         """记录模型输出解析失败事件。"""
         ev = {
@@ -270,6 +292,7 @@ class TraceLogger:
             "user_id": user_id,
             "session_id": session_id,
             "turn_id": turn_id,
+            "attempt_id": attempt_id,
             "step": step,
             "error": error,
         }
@@ -286,6 +309,7 @@ class TraceLogger:
         steps: int,
         duration_ms: float,
         error: str | None = None,
+        attempt_id: int | str = 1,
     ) -> dict[str, Any]:
         """记录单轮请求终止事件（含正常结束与各类异常终止原因）。"""
         ev = {
@@ -293,6 +317,7 @@ class TraceLogger:
             "user_id": user_id,
             "session_id": session_id,
             "turn_id": turn_id,
+            "attempt_id": attempt_id,
             "status": status,
             "answer": answer,
             "steps": steps,
@@ -327,28 +352,31 @@ class TraceLogger:
         for ev in events:
             kind = ev.get("event")
             turn_id = ev.get("turn_id")
+            attempt_id = ev.get("attempt_id", 1)
             if kind == "turn_start":
-                lines.append(f"[turn {turn_id}] START user_input={ev.get('user_input')!r}")
+                lines.append(f"[turn {turn_id}] START attempt={attempt_id} user_input={ev.get('user_input')!r}")
             elif kind == "tool_request":
                 lines.append(
                     f"[turn {turn_id}][step {ev.get('step')}] REQUEST call_id={ev.get('call_id')} "
-                    f"{ev.get('tool')}({ev.get('args')}) thought={ev.get('thought')!r}"
+                    f"attempt={attempt_id} {ev.get('tool')}({ev.get('args')}) thought={ev.get('thought')!r}"
                 )
             elif kind == "tool_result":
                 reused_tag = " reused=True" if ev.get("reused") else ""
                 err_tag = f" error={ev.get('error')!r}" if ev.get("error") else ""
                 lines.append(
                     f"[turn {turn_id}][step {ev.get('step')}] RESULT  call_id={ev.get('call_id')} "
-                    f"{ev.get('tool')} status={ev.get('status')} ok={ev.get('ok')} "
+                    f"attempt={attempt_id} {ev.get('tool')} status={ev.get('status')} ok={ev.get('ok')} "
                     f"duration={ev.get('duration_ms')}ms{reused_tag}{err_tag} -> {ev.get('result')}"
                 )
             elif kind == "parse_error":
-                lines.append(f"[turn {turn_id}][step {ev.get('step')}] PARSE_ERROR {ev.get('error')}")
+                lines.append(
+                    f"[turn {turn_id}][step {ev.get('step')}] PARSE_ERROR attempt={attempt_id} {ev.get('error')}"
+                )
             elif kind == "turn_end":
                 err_tag = f" error={ev.get('error')!r}" if ev.get("error") else ""
                 lines.append(
                     f"[turn {turn_id}] END status={ev.get('status')} steps={ev.get('steps')} "
-                    f"duration={ev.get('duration_ms')}ms{err_tag}"
+                    f"attempt={attempt_id} duration={ev.get('duration_ms')}ms{err_tag}"
                 )
         unfinished = find_unfinished_in_events(events)
         if unfinished:
@@ -376,38 +404,50 @@ def find_unfinished_in_events(events: list[dict[str, Any]]) -> list[dict[str, An
 
 
 def verify_trace_integrity(events: list[dict[str, Any]]) -> dict[str, Any]:
-    """校验 Trace 事件序列的完整性：请求/结果成对、步数从 1 连续递增、终止原因有记录。"""
-    requests: list[dict[str, Any]] = []
-    results_by_key: dict[tuple[Any, int, str], dict[str, Any]] = {}
-    steps_by_turn: dict[Any, list[int]] = {}
-    turn_starts: list[Any] = []
-    turn_ends: list[dict[str, Any]] = []
+    """按每次尝试 (turn_id, attempt_id) 校验 Trace 完整性：请求/结果成对、步数从 1 连续递增、终止原因有记录。"""
+    requests: list[tuple[Any, Any, int, str]] = []
+    results_by_key: dict[tuple[Any, Any, int, str], dict[str, Any]] = {}
+    steps_by_attempt: dict[tuple[Any, Any], list[int]] = {}
+    turn_starts: list[tuple[Any, Any]] = []
+    turn_ends: dict[tuple[Any, Any], dict[str, Any]] = {}
+    implicit_attempts: dict[Any, int] = {}
 
     for ev in events:
         kind = ev.get("event")
         tid = ev.get("turn_id")
         if kind == "turn_start":
-            turn_starts.append(tid)
+            aid = ev.get("attempt_id")
+            if aid is None:
+                aid = implicit_attempts.get(tid, 0) + 1
+            implicit_attempts[tid] = aid
+            turn_starts.append((tid, aid))
         elif kind == "tool_request":
-            requests.append(ev)
-            steps_by_turn.setdefault(tid, []).append(int(ev.get("step", 0)))
+            aid = ev.get("attempt_id", implicit_attempts.get(tid, 1))
+            step = int(ev.get("step", 0))
+            cid = str(ev.get("call_id", ""))
+            requests.append((tid, aid, step, cid))
+            steps_by_attempt.setdefault((tid, aid), []).append(step)
         elif kind == "tool_result":
-            key = (tid, int(ev.get("step", 0)), str(ev.get("call_id", "")))
+            aid = ev.get("attempt_id", implicit_attempts.get(tid, 1))
+            key = (tid, aid, int(ev.get("step", 0)), str(ev.get("call_id", "")))
             results_by_key[key] = ev
         elif kind == "turn_end":
-            turn_ends.append(ev)
+            aid = ev.get("attempt_id", implicit_attempts.get(tid, 1))
+            turn_ends[(tid, aid)] = ev
 
-    paired = all(
-        (r.get("turn_id"), int(r.get("step", 0)), str(r.get("call_id", ""))) in results_by_key
-        for r in requests
-    )
+    paired = all(req_key in results_by_key for req_key in requests)
     contiguous_steps = all(
         steps == list(range(1, len(steps) + 1))
-        for steps in steps_by_turn.values()
+        for steps in steps_by_attempt.values()
     )
-    valid_ends = len(turn_ends) == len(turn_starts) and all(
-        bool(e.get("status")) and (e.get("status") == "ok" or bool(e.get("error")))
-        for e in turn_ends
+    valid_ends = (
+        len(turn_ends) == len(turn_starts)
+        and all(
+            k in turn_ends
+            and bool(turn_ends[k].get("status"))
+            and (turn_ends[k].get("status") == "ok" or bool(turn_ends[k].get("error")))
+            for k in turn_starts
+        )
     )
     unfinished = find_unfinished_in_events(events)
     return {
