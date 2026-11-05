@@ -162,7 +162,7 @@ def test_build_context_triggers_by_turn_limit_and_token_budget():
     assert tight_plan.compressed is True
     assert tight_plan.compressed_turn_count >= 1
     assert tight_plan.kept_turn_count < 4
-    assert estimate_messages_tokens(tight_plan.messages) >= 10
+    assert 10 <= estimate_messages_tokens(tight_plan.messages) <= 200
 
 
 # ---------------- 纯对话追问 & 带工具追问 ----------------

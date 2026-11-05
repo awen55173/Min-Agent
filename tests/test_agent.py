@@ -129,9 +129,12 @@ def test_tool_error_is_fed_back_and_model_recovers(reg):
 
 
 def test_invalid_output_retried_then_succeeds(reg):
-    llm = FakeLLM(["not json", J(action="calculator", action_input={}, final_answer="x"), final("ok")])
+    llm = FakeLLM([
+        "not json", J(action="calculator", action_input={}, final_answer="x"),
+        act("calculator", expression="1+1"), final("2"),
+    ])
     r = Agent(llm, reg).run("q")
-    assert r.status == OK and r.answer == "ok" and r.actions == []
+    assert r.status == OK and r.answer == "2" and len(r.actions) == 1
     assert llm.calls[1][-1]["content"].startswith("Format error")
     assert "mutually exclusive" in llm.calls[2][-1]["content"]
 
@@ -242,11 +245,12 @@ def test_parse_blank_final_answer_error(reg):
 def test_observation_truncated():
     from agent.tools.registry import Tool
     reg = build_registry()
-    reg.register(Tool("big", "d", {"type": "object", "properties": {}}, lambda a, c: "x" * 5000))
+    reg.register(Tool("big", "d", {"type": "object", "properties": {}}, lambda a, c: "x" * 20000))
     llm = FakeLLM([act("big"), final("ok")])
     Agent(llm, reg).run("q")
-    assert "(truncated)" in llm.calls[1][-1]["content"]
-    assert len(llm.calls[1][-1]["content"]) < 2200
+    assert "truncated" in llm.calls[1][-1]["content"]
+    from agent.context import estimate_tokens
+    assert estimate_tokens(llm.calls[1][-1]["content"]) < 2100
 
 
 def test_history_is_inserted_before_user_input(reg):

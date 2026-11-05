@@ -91,6 +91,8 @@ def _present(value: Any) -> bool:
 def parse_output(text: str, registry: ToolRegistry) -> ParsedOutput:
     """解析模型输出并按规则校验：互斥、缺字段、未知工具、参数不合法均抛 ParseError。"""
     obj = extract_json(text)
+    if set(obj) - {"thought", "action", "action_input", "final_answer"}:
+        raise ParseError("unexpected output fields; Observation/tool results must only come from the runtime")
     thought = obj.get("thought")
     thought = thought if isinstance(thought, str) else ""  # thought 缺失可容忍
     has_action = _present(obj.get("action"))

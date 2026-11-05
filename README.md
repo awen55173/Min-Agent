@@ -19,6 +19,8 @@ uv run python cli.py -u alice -s session_id "我有哪些待办？"
 uv run python cli.py -u alice
 # 列出用户的会话
 uv run python cli.py -u alice --list
+# 根据模型容量调整每次请求的估算上下文上限（默认 16000）
+uv run python cli.py --max-context-tokens 24000 -u alice
 ```
 会话数据保存在 `data/{user_id}/{session_id}.json`（可用 `--data-dir` 修改）；`-v` 打印工具调用过程。
 请在项目根目录运行（`.env` 从当前目录读取）。
@@ -32,7 +34,9 @@ uv run python cli.py -u alice --list
 
 ## 上下文管理与压缩（M4）
 - 每次调用 `Agent.run()` 前由 `agent/context.py` 的 `build_context()` 构建发送给模型的有限上下文：`[系统提示词, (可选)结构化摘要, 最近 N 轮对话原文(剥离历史 thought), 本轮输入]`。
-- 触发压缩条件：历史轮数超过 `max_history_turns`（默认 6），或估算 token 数超过 `max_context_tokens - reserved_tokens`（默认 4000 - 1200，为本轮工具调用与结果预留空间）。
+- 触发压缩条件：历史轮数超过 `max_history_turns`（默认 6），或估算 token 数超过 `max_context_tokens - reserved_tokens`（默认 16000 - 4000，为本轮工具调用与结果预留空间）。摘要默认限制为 2000 估算 tokens，包含待办的条数和文本长度限制；省略条目时提示通过 `todo.list` 查询完整实时状态。
+- 每次模型调用（包括连续工具调用、格式纠正）发送前检查硬上限；无法容纳时返回 `context_limit` 并保存已执行操作，提示缩短输入或分批处理。系统提示和本轮输入不会被静默截断。此上限使用项目估算器，不等同于模型 tokenizer 的精确计数。
+- 非法模型输出不会进入有效历史；纠错明确提示“本次工具未执行”。若模型随后直接声称已完成，返回 `tool_not_executed`，必须重新合法执行工具后才能正常结束。
 - 结构化摘要显式保留 5 类信息：用户目标、关键事实、待办 ID 与状态、已执行操作、未完成事项；历史 `thought` 不进入摘要或历史消息；待办状态与 `TodoStore` 实时对齐。
 - 完整的持久化历史（`data.history`）与发送给模型的受限上下文分离，压缩不会影响 CLI 交互式会话恢复时的完整历史回放。
 

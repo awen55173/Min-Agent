@@ -280,7 +280,7 @@ def test_wrapped_or_partial_outputs_rejected_and_never_execute_tool(bad_output):
         parse_output(bad_output, reg)
     llm = FakeLLM([bad_output, final("ok")])
     r = Agent(llm, reg).run("q", "u", "s")
-    assert r.status == OK and r.actions == []
+    assert r.status == "tool_not_executed" and r.actions == []
     assert store.list(ToolContext("u", "s")) == []
     assert llm.calls[1][-1]["content"].startswith("Format error:")
 
@@ -297,7 +297,9 @@ def test_deeply_nested_input_triggers_format_correction_not_internal_error(deep)
         parse_output(deep, reg)
     llm = FakeLLM([deep, final("recovered")])
     r = Agent(llm, reg).run("q", "u", "s")
-    assert r.status == OK and r.answer == "recovered"
+    assert r.status == ("tool_not_executed" if '"action"' in deep else OK)
+    if r.status == OK:
+        assert r.answer == "recovered"
     assert llm.calls[1][-1]["content"].startswith("Format error:")
     r_exhausted = Agent(FakeLLM([deep] * 4), reg, max_parse_retries=3).run("q", "u", "s")
     assert r_exhausted.status == "parse_retries_exhausted"
@@ -308,6 +310,6 @@ def test_ambiguous_output_never_executes_tool():
     reg = build_registry(todo_store=store)
     llm = FakeLLM([act("todo", action="add", text="x") + final("done"), final("ok")])
     r = Agent(llm, reg).run("q", "u", "s")
-    assert r.status == OK and r.actions == []
+    assert r.status == "tool_not_executed" and r.actions == []
     assert store.list(ToolContext("u", "s")) == []
     assert "ambiguous" in llm.calls[1][-1]["content"]

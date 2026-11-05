@@ -11,6 +11,9 @@ from .parser import ParseError, extract_json
 
 _OBS_RE = re.compile(r"^Observation \(tool=([^,]+), status=(ok|error|interrupted)\): (.*)$", re.S)
 _TODO_LINE_RE = re.compile(r"^- #(\d+)\s+\[(pending|done|deleted)[^\]]*\]\s+(.*)$")
+DEFAULT_CONTEXT_TOKENS = 16000
+DEFAULT_RESERVED_TOKENS = 4000
+DEFAULT_SUMMARY_TOKENS = 2000
 _ABNORMAL_PREFIXES = (
     "已达最大步数",
     "模型输出格式多次不合法",
@@ -18,7 +21,13 @@ _ABNORMAL_PREFIXES = (
     "内部错误：",
     "本轮被中断",
     "（本轮被意外中断",
+    "上下文预算不足",
+    "工具调用未执行",
 )
+
+
+class ContextBudgetError(Exception):
+    """固定上下文无法放入预算，调用方应结束请求并保存已完成操作。"""
 
 
 def estimate_tokens(text: str) -> int:
@@ -33,6 +42,46 @@ def estimate_tokens(text: str) -> int:
 def estimate_messages_tokens(messages: list[Message]) -> int:
     """估算消息列表的总 token 数（含每条消息的角色与格式开销）。"""
     return sum(4 + estimate_tokens(m.get("content", "")) for m in messages)
+
+
+def _clip_preserve_edges(text: str, max_chars: int) -> str:
+    """截断文本时同时保留开头和结尾，避免末尾的金额、地点或偏好丢失。"""
+    if max_chars <= 0:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    if max_chars <= 12:
+        return text[:max_chars]
+    head = max_chars // 2
+    marker = " …(已压缩)… "
+    tail = max_chars - head - len(marker)
+    return f"{text[:head]}{marker}{text[-tail:]}" if tail > 0 else text[:max_chars]
+
+
+def truncate_to_tokens(text: str, max_tokens: int) -> str:
+    """把单条消息压缩到 token 上限，并优先保留两端内容。"""
+    if max_tokens <= 0:
+        return ""
+    if estimate_tokens(text) <= max_tokens:
+        return text
+    low, high = 0, len(text)
+    best = ""
+    while low <= high:
+        mid = (low + high) // 2
+        candidate = _clip_preserve_edges(text, mid)
+        if estimate_tokens(candidate) <= max_tokens:
+            best = candidate
+            low = mid + 1
+        else:
+            high = mid - 1
+    return best
+
+
+def check_context_budget(messages: list[Message], max_tokens: int) -> None:
+    """校验每次模型请求的硬预算，超限时明确拒绝发送。"""
+    used = estimate_messages_tokens(messages)
+    if used > max_tokens:
+        raise ContextBudgetError(f"上下文预算不足：估算 {used} tokens，上限 {max_tokens}；请缩短输入或分批处理。")
 
 
 def _is_turn_start(msg: Message) -> bool:
@@ -112,6 +161,27 @@ def _select_prioritized(items: list[str], limit: int) -> list[str]:
     return items[:head] + items[-tail:]
 
 
+_COMMON_CITIES = (
+    "北京|上海|广州|深圳|苏州|杭州|成都|重庆|武汉|西安|南京|天津|青岛|厦门|长沙|郑州|济南|合肥|福州|昆明|大连|宁波|无锡|哈尔滨|沈阳|石家庄"
+)
+
+
+def _extract_user_facts(text: str) -> list[str]:
+    """从用户输入提取金额、地点和偏好等短事实，避免摘要只保留前缀。"""
+    facts: list[str] = []
+    for match in re.finditer(r"(?:预算|金额|价格|费用|花费)\s*[:：]?\s*([\d,.]+)\s*(元|人民币|块)?", text, re.I):
+        _add_unique(facts, f"金额/预算: {match.group(1)}{match.group(2) or ''}")
+    for match in re.finditer(rf"(?:{_COMMON_CITIES})(?:市)?", text):
+        _add_unique(facts, f"地点: {match.group(0)}")
+    for match in re.finditer(r"(?:城市|目的地|地点|居住地)\s*[:：为是]?\s*([^，。；,;、\s]{1,16})", text):
+        _add_unique(facts, f"地点: {match.group(1)}")
+    for match in re.finditer(r"\d+(?:\.\d+)?\s*(?:万元|元|人|天|小时|分钟|度|岁|%|％|公里|千米|kg|km|°C)", text):
+        _add_unique(facts, f"数值: {match.group(0).strip()}")
+    for match in re.finditer(r"(?:素食|清真|无糖|低脂|不吃[^，。；,;\s]{1,8}|偏好\s*[:：]?\s*[^，。；,;\s]{1,12})", text, re.I):
+        _add_unique(facts, f"偏好: {match.group(0).strip()}")
+    return facts
+
+
 @dataclass
 class StructuredSummary:
     """结构化摘要数据：保留用户目标、关键事实、待办 ID 与状态、已执行操作和未完成事项。"""
@@ -168,16 +238,19 @@ class StructuredSummary:
 
     def _render(self, max_items: int, max_chars: int) -> str:
         """按指定的条目上限与单条字符上限渲染摘要文本。"""
-        goals = [f"- {g[:max_chars]}" for g in _select_prioritized(self.user_goals, max_items)]
+        goals = [f"- {_clip_preserve_edges(g, max_chars)}" for g in _select_prioritized(self.user_goals, max_items)]
         tool_facts = [f for f in self.key_facts if not f.startswith("对话:")]
         chat_facts = [f for f in self.key_facts if f.startswith("对话:")]
         kept_facts = _select_prioritized(tool_facts, max_items)
         if len(kept_facts) < max_items:
             kept_facts += _select_prioritized(chat_facts, max_items - len(kept_facts))
-        facts = [f"- {f[:max_chars]}" for f in kept_facts]
-        todos = self._todo_lines()
-        actions = [f"- {a[:max_chars]}" for a in _select_prioritized(self.completed_actions, max_items)]
-        unfinished = [u[: max_chars + 16] for u in self._unfinished_lines()]
+        facts = [f"- {_clip_preserve_edges(f, max_chars)}" for f in kept_facts]
+        todo_lines = self._todo_lines()
+        todos = [_clip_preserve_edges(t, max_chars + 36) for t in _select_prioritized(todo_lines, max_items)]
+        if len(todo_lines) > max_items:
+            todos.append(f"- 另有 {len(todo_lines) - max_items} 条待办未展示；请调用 todo.list 获取完整 ID 与实时状态。")
+        actions = [f"- {_clip_preserve_edges(a, max_chars)}" for a in _select_prioritized(self.completed_actions, max_items)]
+        unfinished = [_clip_preserve_edges(u, max_chars + 36) for u in _select_prioritized(self._unfinished_lines(), max_items)]
 
         sections = [
             "[历史对话结构化摘要 / Conversation Summary]",
@@ -196,12 +269,12 @@ class StructuredSummary:
         return "\n".join(sections)
 
     def format(self, max_tokens: int | None = None) -> str:
-        """渲染结构化摘要；若指定 max_tokens 则自动收缩普通条目以控制长度，始终保留待办 ID。"""
+        """渲染摘要并限制条目与待办大小，预算不足时拒绝生成残缺摘要。"""
         for max_items, max_chars in ((12, 160), (8, 120), (5, 90), (3, 60), (2, 45), (1, 35)):
             text = self._render(max_items, max_chars)
             if max_tokens is None or estimate_tokens(text) <= max_tokens:
                 return text
-        return text
+        raise ContextBudgetError("上下文预算不足：结构化摘要无法放入预算；请增加预算或分批处理。")
 
 
 def parse_summary(summary_text: str) -> StructuredSummary:
@@ -374,6 +447,8 @@ def summarize_turns(
                 if not user_text:
                     user_text = content.strip()
                     _add_unique(summary.user_goals, user_text)
+                    for fact in _extract_user_facts(user_text):
+                        _add_unique(summary.key_facts, fact)
             elif role == "assistant":
                 try:
                     obj = extract_json(content)
@@ -391,6 +466,8 @@ def summarize_turns(
                 first_line = final_answer.splitlines()[0]
                 _add_unique(summary.unfinished_notes, f"未完成请求「{user_text[:40]}」: {first_line[:60]}")
             elif user_text:
+                for fact in _extract_user_facts(final_answer):
+                    _add_unique(summary.key_facts, f"回答中的{fact}")
                 prefix = "对话: " if had_tool_fact else "事实: "
                 _add_unique(summary.key_facts, f"{prefix}{user_text[:60]} -> {final_answer[:80]}")
 
@@ -398,13 +475,15 @@ def summarize_turns(
     return summary
 
 
-def refresh_summary_todos(summary_text: str, todos: dict[str, Any] | None) -> str:
-    """当摘要非空时，用最新的待办存储状态刷新摘要中的待办状态与未完成事项。"""
+def refresh_summary_todos(
+    summary_text: str, todos: dict[str, Any] | None, max_tokens: int | None = None,
+) -> str:
+    """用待办实时状态刷新已有摘要，并按需限制发送长度。"""
     if not summary_text or not summary_text.strip():
         return ""
     summary = parse_summary(summary_text)
     summary.apply_todo_store(todos)
-    return summary.format()
+    return summary.format(max_tokens=max_tokens)
 
 
 @dataclass
@@ -427,14 +506,14 @@ def build_context(
     existing_summary: str = "",
     todos: dict[str, Any] | None = None,
     max_history_turns: int = 6,
-    max_context_tokens: int = 4000,
-    reserved_tokens: int = 1200,
-    max_summary_tokens: int = 600,
+    max_context_tokens: int = DEFAULT_CONTEXT_TOKENS,
+    reserved_tokens: int = DEFAULT_RESERVED_TOKENS,
+    max_summary_tokens: int = DEFAULT_SUMMARY_TOKENS,
 ) -> ContextPlan:
     """构建发送给模型的受限上下文：系统提示 +（可选）结构化摘要 + 最近对话原文（剥离 thought）+ 本轮输入。
 
-    按历史轮数上限（max_history_turns）和预留工具空间后的 token 预算（max_context_tokens - reserved_tokens）
-    触发压缩；不修改传入的 history 列表。
+    按历史轮数上限和预留工具空间后的目标预算触发压缩，并保证最终消息不超过
+    max_context_tokens；不修改传入的 history 列表。
     """
     turns = split_into_turns(history)
     sanitized_turns = [sanitize_turn(t) for t in turns]
@@ -442,18 +521,19 @@ def build_context(
 
     sys_msg: Message = {"role": "system", "content": system_prompt}
     user_msg: Message = {"role": "user", "content": user_input}
-    budget = max(max_context_tokens - reserved_tokens, 1)
+    hard_budget = max_context_tokens
+    fixed_tokens = estimate_messages_tokens([sys_msg, user_msg])
+    check_context_budget([sys_msg, user_msg], hard_budget)
+    budget = max(hard_budget - max(reserved_tokens, 0), fixed_tokens)
 
-    refreshed_existing = refresh_summary_todos(existing_summary, todos) if existing_summary.strip() else ""
+    refreshed_existing = refresh_summary_todos(existing_summary, todos, max_summary_tokens) if existing_summary.strip() else ""
     base_msgs: list[Message] = [sys_msg]
     if refreshed_existing:
         base_msgs.append({"role": "system", "content": refreshed_existing})
     base_msgs.extend(all_recent)
     base_msgs.append(user_msg)
 
-    need_compress = len(turns) > max_history_turns or (
-        len(turns) > 0 and estimate_messages_tokens(base_msgs) > budget
-    )
+    need_compress = len(turns) > max_history_turns or estimate_messages_tokens(base_msgs) > budget
     if not need_compress:
         return ContextPlan(
             messages=base_msgs,
@@ -469,9 +549,6 @@ def build_context(
     if keep_count == len(turns):
         keep_count = max(len(turns) - 1, 0)
 
-    fixed_tokens = estimate_messages_tokens([sys_msg, user_msg])
-    remaining_for_history = max(budget - fixed_tokens, 64)
-
     while True:
         split_idx = len(turns) - keep_count
         compressed_turns = turns[:split_idx]
@@ -479,12 +556,18 @@ def build_context(
         recent_messages = [m for t in kept_turns for m in t]
 
         summary_obj = summarize_turns(compressed_turns, existing_summary=existing_summary, todos=todos)
-        summary_cap = (
-            min(max_summary_tokens, max(remaining_for_history // 2, 80))
-            if keep_count > 0
-            else min(max_summary_tokens, remaining_for_history)
-        )
-        summary_text = summary_obj.format(max_tokens=summary_cap)
+        # 保留整轮历史，并按实际剩余空间分配摘要预算；不截断系统提示和本轮输入。
+        remaining = budget - fixed_tokens - estimate_messages_tokens(recent_messages) - 4
+        try:
+            summary_text = summary_obj.format(max_tokens=min(max_summary_tokens, remaining))
+        except ContextBudgetError:
+            if keep_count > 0:
+                keep_count -= 1
+                continue
+            if budget < hard_budget:
+                budget = hard_budget
+                continue
+            raise
         candidate_msgs: list[Message] = [
             sys_msg,
             {"role": "system", "content": summary_text},
@@ -492,7 +575,8 @@ def build_context(
             user_msg,
         ]
         total_tokens = estimate_messages_tokens(candidate_msgs)
-        if total_tokens <= budget or keep_count == 0:
+        check_context_budget(candidate_msgs, hard_budget)
+        if total_tokens <= budget:
             return ContextPlan(
                 messages=candidate_msgs,
                 recent_messages=recent_messages,

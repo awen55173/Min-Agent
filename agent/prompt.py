@@ -25,6 +25,8 @@ Reply with exactly ONE JSON object and nothing else. Choose one of:
 - Call at most one tool per reply, then wait. The result comes back as a message starting with "Observation".
 - Use only the tools listed above, with arguments that match their schema.
 - Never invent tool results. Base the final answer on real observations.
+- An invalid reply executes no tool. After a format error, resend the intended tool call and wait for a real Observation before claiming completion.
+- If an Observation is truncated, narrow the query or read in batches; do not assume omitted content.
 - If an observation reports an error, fix the arguments and retry, or explain the problem to the user.
 - To complete/delete a todo, use the id returned by the todo tool (list it first if unknown).
 - Answer directly with final_answer when no tool is needed.

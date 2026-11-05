@@ -6,6 +6,7 @@ import re
 import sys
 
 from agent.config import ConfigError, Settings
+from agent.context import DEFAULT_CONTEXT_TOKENS
 from agent.llm import LLMClient, OpenAIClient
 from agent.loop import OK, Agent, AgentResult
 from agent.parser import ParseError, extract_json
@@ -68,13 +69,18 @@ def _build_parser() -> argparse.ArgumentParser:
     group.add_argument("--new", action="store_true", help="新建会话（未指定 --session 时的默认行为）")
     p.add_argument("--list", action="store_true", help="列出该用户的会话 ID 后退出")
     p.add_argument("--data-dir", default="data", help="会话存储目录（默认 data）")
+    p.add_argument("--max-context-tokens", type=int, default=DEFAULT_CONTEXT_TOKENS,
+                   help=f"每次模型请求的估算上下文 token 上限（默认 {DEFAULT_CONTEXT_TOKENS}）")
     p.add_argument("-v", "--verbose", action="store_true", help="打印工具调用过程")
     return p
 
 
 def main(argv: list[str] | None = None) -> int:
     """解析参数、定位或新建会话并运行 Agent；失败时输出错误并返回 1。"""
-    args = _build_parser().parse_args(argv)
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    if args.max_context_tokens <= 0:
+        parser.error("--max-context-tokens must be positive")
     manager = SessionManager(args.data_dir)
     try:
         if args.list:
@@ -90,6 +96,7 @@ def main(argv: list[str] | None = None) -> int:
         service = ChatService(
             OpenAIClient(settings), manager,
             lambda store: build_registry(settings.tavily_api_key, todo_store=store),
+            max_context_tokens=args.max_context_tokens,
         )
         print(f"[session] user={args.user} id={session_id}", file=sys.stderr)
         create = not resume  # 新会话在首轮保存时落盘

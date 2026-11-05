@@ -4,6 +4,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from .context import (
+    DEFAULT_CONTEXT_TOKENS,
+    ContextBudgetError,
+    check_context_budget,
+    estimate_tokens,
+    truncate_to_tokens,
+)
 from .llm import LLMClient, LLMError, Message
 from .parser import ParseError, parse_output
 from .prompt import build_system_prompt
@@ -15,8 +22,10 @@ PARSE_EXHAUSTED = "parse_retries_exhausted"
 LLM_FAILED = "llm_error"
 INTERNAL_ERROR = "internal_error"
 INTERRUPTED = "interrupted"
+TOOL_NOT_EXECUTED = "tool_not_executed"
+CONTEXT_LIMIT = "context_limit"
 
-_OBS_MAX = 2000  # 单条 observation 的最大字符数
+_OBS_MAX_TOKENS = 2000  # 单条 observation 的最大估算 token 数
 
 
 @dataclass
@@ -53,12 +62,20 @@ def _summarize(actions: list[ActionRecord]) -> str:
 class Agent:
     """最小 Agent：单次请求内的 ReAct 循环（同步工具调用）。"""
 
-    def __init__(self, llm: LLMClient, registry: ToolRegistry, max_steps: int = 8, max_parse_retries: int = 3):
-        """保存依赖与预算：max_steps 为单轮最大工具调用数，max_parse_retries 为连续解析失败上限。"""
+    def __init__(
+        self,
+        llm: LLMClient,
+        registry: ToolRegistry,
+        max_steps: int = 8,
+        max_parse_retries: int = 3,
+        max_context_tokens: int = DEFAULT_CONTEXT_TOKENS,
+    ):
+        """保存依赖与预算：限制工具步数、解析重试次数和每次模型请求的上下文大小。"""
         self._llm = llm
         self._registry = registry
         self._max_steps = max_steps
         self._max_parse_retries = max_parse_retries
+        self._max_context_tokens = max_context_tokens
         self._pending: str | None = None  # 正在执行的工具名
 
     def run(
@@ -115,35 +132,62 @@ class Agent:
     def _loop(self, messages: list[Message], ctx: ToolContext, actions: list[ActionRecord], finish) -> AgentResult:
         """核心循环：调用 LLM、解析、执行工具并回填，直到得到最终答案或预算耗尽。"""
         parse_failures = 0
+        unexecuted_tool_output = False
         while True:
             self._pending = None
             try:
+                check_context_budget(messages, self._max_context_tokens)
                 raw = self._llm.chat(messages)
+            except ContextBudgetError as e:
+                return finish(CONTEXT_LIMIT, f"{e}\n本轮任务可能未完成，已执行操作已保留。\n{_summarize(actions)}")
             except LLMError as e:
                 return finish(LLM_FAILED, f"模型服务暂时不可用，请稍后重试。（{e}）\n{_summarize(actions)}")
-            messages.append({"role": "assistant", "content": raw})
-
             try:
                 parsed = parse_output(raw, self._registry)
             except ParseError as e:
+                # 非法输出只进入纠错提示，不作为 assistant 历史保存，避免伪造 observation 污染上下文。
+                unexecuted_tool_output = unexecuted_tool_output or (
+                    '"action"' in raw or "observation" in raw.lower()
+                )
                 parse_failures += 1
                 if parse_failures > self._max_parse_retries:
                     return finish(PARSE_EXHAUSTED, f"模型输出格式多次不合法，已停止。最近一次原因：{e}\n{_summarize(actions)}")
-                messages.append({"role": "user", "content": f"Format error: {e}. Reply again with a single valid JSON object."})
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        f"Format error: {e}. Reply again with a single valid JSON object. "
+                        "本次工具未执行（the tool was not executed）；请勿声称工具已经成功。"
+                    ),
+                })
                 continue
             parse_failures = 0
 
             if parsed.kind == "final":
+                if unexecuted_tool_output:
+                    return finish(
+                        TOOL_NOT_EXECUTED,
+                        "工具调用未执行，无法确认请求已完成。请重新发送请求，让我先实际执行工具。\n"
+                        + _summarize(actions),
+                    )
+                messages.append({"role": "assistant", "content": raw})
                 return finish(OK, parsed.final_answer or "")
 
             if len(actions) >= self._max_steps:
                 return finish(MAX_STEPS, f"已达最大步数（{self._max_steps}），任务可能未完成。\n{_summarize(actions)}")
+            messages.append({"role": "assistant", "content": raw})
             self._pending = parsed.action  # 执行期间被中断时据此补写 observation
             result = self._registry.execute(parsed.action, parsed.action_input, ctx)
+            if result.ok:
+                unexecuted_tool_output = False
             actions.append(
                 ActionRecord(len(actions) + 1, parsed.thought, parsed.action, parsed.action_input, result.ok, result.content)
             )
             status = "ok" if result.ok else "error"
-            content = result.content if len(result.content) <= _OBS_MAX else result.content[:_OBS_MAX] + "...(truncated)"
-            messages.append({"role": "user", "content": f"Observation (tool={parsed.action}, status={status}): {content}"})
+            prefix = f"Observation (tool={parsed.action}, status={status}): "
+            content = result.content
+            if estimate_tokens(prefix + content) > _OBS_MAX_TOKENS:
+                marker = " ...(truncated) 结果已截断，可缩小查询范围或分批读取。"
+                available = _OBS_MAX_TOKENS - estimate_tokens(prefix) - estimate_tokens(marker)
+                content = truncate_to_tokens(content, available) + marker
+            messages.append({"role": "user", "content": prefix + content})
             self._pending = None

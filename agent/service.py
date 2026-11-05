@@ -4,9 +4,15 @@ from __future__ import annotations
 import json
 from typing import Callable
 
-from .context import build_context, refresh_summary_todos
+from .context import (
+    DEFAULT_CONTEXT_TOKENS,
+    DEFAULT_RESERVED_TOKENS,
+    ContextBudgetError,
+    build_context,
+    refresh_summary_todos,
+)
 from .llm import LLMClient
-from .loop import OK, Agent, AgentResult
+from .loop import CONTEXT_LIMIT, OK, Agent, AgentResult
 from .prompt import build_system_prompt
 from .session import SessionManager
 from .tools.registry import ToolContext, ToolRegistry
@@ -28,8 +34,8 @@ class ChatService:
         max_steps: int = 8,
         max_parse_retries: int = 3,
         max_history_turns: int = 6,
-        max_context_tokens: int = 4000,
-        reserved_tokens: int = 1200,
+        max_context_tokens: int = DEFAULT_CONTEXT_TOKENS,
+        reserved_tokens: int = DEFAULT_RESERVED_TOKENS,
     ):
         """保存依赖及循环/上下文预算参数。"""
         self._llm = llm
@@ -55,19 +61,29 @@ class ChatService:
             store = TodoStore()
             store.load_state(ctx, data.todos)
             registry = self._factory(store)
-            ctx_plan = build_context(
-                system_prompt=build_system_prompt(registry),
-                history=data.history,
-                user_input=text,
-                existing_summary=data.summary,
-                todos=data.todos,
-                max_history_turns=self._max_history_turns,
-                max_context_tokens=self._max_context_tokens,
-                reserved_tokens=self._reserved_tokens,
-            )
+            try:
+                ctx_plan = build_context(
+                    system_prompt=build_system_prompt(registry),
+                    history=data.history,
+                    user_input=text,
+                    existing_summary=data.summary,
+                    todos=data.todos,
+                    max_history_turns=self._max_history_turns,
+                    max_context_tokens=self._max_context_tokens,
+                    reserved_tokens=self._reserved_tokens,
+                )
+            except ContextBudgetError as e:
+                turn_id = session.next_turn_id()
+                messages = [{"role": "user", "content": text}, _assistant_final(str(e))]
+                data.history += messages
+                session.save()
+                return AgentResult(CONTEXT_LIMIT, str(e), messages=messages, turn_id=turn_id)
             data.summary = ctx_plan.summary
             prefix_len = len(ctx_plan.messages) - 1  # 本轮 user_input 之前的上下文消息数
-            agent = Agent(self._llm, registry, self._max_steps, self._max_parse_retries)
+            agent = Agent(
+                self._llm, registry, self._max_steps, self._max_parse_retries,
+                max_context_tokens=self._max_context_tokens,
+            )
             turn_id = session.next_turn_id()
             try:
                 result = agent.run(text, user_id, session_id, turn_id, context_messages=ctx_plan.messages)
