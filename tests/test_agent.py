@@ -42,10 +42,14 @@ def test_parse_final(reg):
     assert p.kind == "final" and p.final_answer == "hi"
 
 
-def test_parse_code_block_and_surrounding_text(reg):
-    text = "Sure:\n```json\n" + final("ok") + "\n```\nbye"
+def test_parse_code_block_and_reject_surrounding_text(reg):
+    text = "```json\n" + final("ok") + "\n```"
     assert parse_output(text, reg).final_answer == "ok"
-    assert parse_output("I will answer " + final("x") + " done", reg).final_answer == "x"
+    assert parse_output("```\n" + final("x") + "\n```", reg).final_answer == "x"
+    with pytest.raises(ParseError):
+        parse_output("Sure:\n```json\n" + final("ok") + "\n```\nbye", reg)
+    with pytest.raises(ParseError):
+        parse_output("I will answer " + final("x") + " done", reg)
 
 
 def test_parse_missing_thought_tolerated(reg):

@@ -259,10 +259,48 @@ def test_multiple_json_objects_rejected(reg, text):
         parse_output(text, reg)
 
 
-def test_single_object_with_prose_and_nested_still_ok(reg):
-    text = "Sure, here it is: " + act("todo", action="add", text="a {b} c") + " -- thanks {not json}"
+def test_single_object_in_fence_with_braces_in_string_still_ok(reg):
+    text = "```json\n" + act("todo", action="add", text="a {b} c") + "\n```"
     p = parse_output(text, reg)
     assert p.action == "todo" and p.action_input["text"] == "a {b} c"
+
+
+@pytest.mark.parametrize("bad_output", [
+    "[" + act("todo", action="add", text="in-array") + "]",
+    "```json\n[" + act("todo", action="add", text="in-fenced-array") + "]\n```",
+    '{"outer": ' + act("todo", action="add", text="in-broken-outer"),
+    '{"outer": ' + act("todo", action="add", text="in-wrapped-outer") + "}",
+    "Sure, here it is: " + act("todo", action="add", text="in-prose") + " -- thanks",
+    "```json\n" + act("todo", action="add", text="unclosed-fence"),
+])
+def test_wrapped_or_partial_outputs_rejected_and_never_execute_tool(bad_output):
+    store = TodoStore()
+    reg = build_registry(todo_store=store)
+    with pytest.raises(ParseError):
+        parse_output(bad_output, reg)
+    llm = FakeLLM([bad_output, final("ok")])
+    r = Agent(llm, reg).run("q", "u", "s")
+    assert r.status == OK and r.actions == []
+    assert store.list(ToolContext("u", "s")) == []
+    assert llm.calls[1][-1]["content"].startswith("Format error:")
+
+
+@pytest.mark.parametrize("deep", [
+    '{"a":' * 2000 + "1" + "}" * 2000,
+    "[" * 2000 + "]" * 2000,
+    '{"action": "todo", "action_input": ' + '{"a":' * 60 + "1" + "}" * 61,
+])
+def test_deeply_nested_input_triggers_format_correction_not_internal_error(deep):
+    store = TodoStore()
+    reg = build_registry(todo_store=store)
+    with pytest.raises(ParseError):
+        parse_output(deep, reg)
+    llm = FakeLLM([deep, final("recovered")])
+    r = Agent(llm, reg).run("q", "u", "s")
+    assert r.status == OK and r.answer == "recovered"
+    assert llm.calls[1][-1]["content"].startswith("Format error:")
+    r_exhausted = Agent(FakeLLM([deep] * 4), reg, max_parse_retries=3).run("q", "u", "s")
+    assert r_exhausted.status == "parse_retries_exhausted"
 
 
 def test_ambiguous_output_never_executes_tool():

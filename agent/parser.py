@@ -1,4 +1,4 @@
-"""解析并校验模型输出：提取 thought、工具调用或最终答案，并强制二者互斥。"""
+"""解析并校验模型输出：仅接受完整的顶层 JSON 对象或完整代码块，提取工具调用或最终答案并强制二者互斥。"""
 from __future__ import annotations
 
 import json
@@ -7,6 +7,7 @@ from typing import Any
 
 from .tools.registry import ToolError, ToolRegistry, validate_args
 
+_MAX_JSON_DEPTH = 32
 
 
 class ParseError(Exception):
@@ -24,55 +25,60 @@ class ParsedOutput:
     final_answer: str | None = None
 
 
-def _loads_object(text: str) -> dict | None:
-    """尝试把文本解析为 JSON 对象，失败返回 None。"""
-    try:
-        obj = json.loads(text)
-    except ValueError:
-        return None
-    return obj if isinstance(obj, dict) else None
+def _check_depth(root: Any, max_depth: int = _MAX_JSON_DEPTH) -> None:
+    """迭代检查 JSON 结构嵌套深度，超过上限抛 ParseError，防止深层嵌套引发内部异常。"""
+    stack: list[tuple[Any, int]] = [(root, 0)]
+    while stack:
+        cur, depth = stack.pop()
+        if depth > max_depth:
+            raise ParseError(f"JSON nesting depth exceeds limit ({max_depth})")
+        if isinstance(cur, dict):
+            for v in cur.values():
+                if isinstance(v, (dict, list)):
+                    stack.append((v, depth + 1))
+        elif isinstance(cur, list):
+            for v in cur:
+                if isinstance(v, (dict, list)):
+                    stack.append((v, depth + 1))
+
+
+def _unwrap_fence(text: str) -> str:
+    """若文本为完整代码块则剥离围栏；存在未闭合或多个代码块时抛 ParseError。"""
+    if not text.startswith("```"):
+        return text
+    if not text.endswith("```") or len(text) < 6:
+        raise ParseError("output is not valid JSON: unclosed code block; reply with a single JSON object")
+    inner = text[3:-3]
+    if "```" in inner:
+        raise ParseError(
+            "ambiguous output: multiple code blocks are not allowed; reply with a single JSON object"
+        )
+    if inner[:4].lower() == "json" and (len(inner) == 4 or inner[4] in " \t\r\n{"):
+        inner = inner[4:]
+    candidate = inner.strip()
+    if not candidate:
+        raise ParseError("empty code block; reply with a single JSON object")
+    return candidate
 
 
 def extract_json(text: str) -> dict:
-    """提取输出中唯一的 JSON 对象（整段、代码块或夹在文字中均可）。
-
-    找不到抛 ParseError；出现多个顶层 JSON 对象时视为歧义输出，同样抛 ParseError，不取其中任何一个。
-    """
+    """提取模型输出中的 JSON 对象：仅接受完整的顶层对象或完整代码块，其余情况统一抛 ParseError。"""
     text = text.strip()
     if not text:
         raise ParseError("empty output; reply with a single JSON object")
-    obj = _loads_object(text)
-    if obj is not None:
-        return obj
-    found = _scan_objects(text)
-    if len(found) == 1:
-        return found[0]
-    if len(found) > 1:
+    candidate = _unwrap_fence(text)
+    try:
+        obj = json.loads(candidate)
+    except RecursionError:
+        raise ParseError("JSON nesting is too deep; reply with a flat JSON object") from None
+    except ValueError:
         raise ParseError(
-            f"ambiguous output: found {len(found)} JSON objects; reply with exactly ONE JSON object "
-            "(one tool call or one final_answer)"
-        )
-    raise ParseError("output is not valid JSON; reply with a single JSON object in the required format")
-
-
-def _scan_objects(text: str) -> list[dict]:
-    """扫描文本中所有顶层 JSON 对象（已解析对象的内部不再重复扫描）。"""
-    decoder = json.JSONDecoder()
-    found: list[dict] = []
-    i = 0
-    while i < len(text):
-        if text[i] == "{":
-            try:
-                obj, end = decoder.raw_decode(text, i)
-            except ValueError:
-                i += 1
-                continue
-            if isinstance(obj, dict):
-                found.append(obj)
-            i = end
-            continue
-        i += 1
-    return found
+            "output is not valid JSON (or contains extra/ambiguous content); reply with a single JSON object"
+        ) from None
+    if not isinstance(obj, dict):
+        raise ParseError("output is not valid JSON object; top-level value must be a JSON object")
+    _check_depth(obj)
+    return obj
 
 
 def _present(value: Any) -> bool:

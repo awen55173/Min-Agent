@@ -68,14 +68,21 @@ class Agent:
         session_id: str = "default",
         turn_id: TurnId | None = None,
         history: list[Message] | None = None,
+        summary: str | None = None,
+        context_messages: list[Message] | None = None,
     ) -> AgentResult:
         """处理一次用户输入并返回结果；整轮使用同一个 turn_id 供待办去重，未传入时自动生成全局唯一 ID。"""
         if turn_id is None:
             turn_id = new_turn_id()
         ctx = ToolContext(user_id, session_id, turn_id)
-        messages: list[Message] = [{"role": "system", "content": build_system_prompt(self._registry)}]
-        messages += history or []
-        messages.append({"role": "user", "content": user_input})
+        if context_messages is not None:
+            messages: list[Message] = [dict(m) for m in context_messages]
+        else:
+            messages = [{"role": "system", "content": build_system_prompt(self._registry)}]
+            if summary and summary.strip():
+                messages.append({"role": "system", "content": summary})
+            messages += history or []
+            messages.append({"role": "user", "content": user_input})
 
         actions: list[ActionRecord] = []
 

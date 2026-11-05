@@ -64,7 +64,7 @@ def _empty_todos() -> dict:
 
 @dataclass
 class SessionData:
-    """会话持久化数据：历史、待办、下一条待办 ID、轮次计数与版本号。"""
+    """会话持久化数据：历史、结构化摘要、待办、下一条待办 ID、轮次计数与版本号。"""
 
     user_id: str
     session_id: str
@@ -74,12 +74,14 @@ class SessionData:
     todos: dict[str, Any] = field(default_factory=_empty_todos)
     created_at: str = field(default_factory=_now)
     updated_at: str = field(default_factory=_now)
+    summary: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         """转为可写入 JSON 的字典。"""
         return {
             "user_id": self.user_id, "session_id": self.session_id, "version": self.version,
             "next_turn": self.next_turn, "history": self.history, "todos": self.todos,
+            "summary": self.summary,
             "created_at": self.created_at, "updated_at": self.updated_at,
         }
 
@@ -125,13 +127,16 @@ def validate_session_dict(raw: Any, user_id: str, session_id: str) -> SessionDat
         if not (isinstance(m, dict) and m.get("role") in _ROLES and isinstance(m.get("content"), str)):
             raise SessionCorruptError(f"invalid history message: {m!r}")
     todos = _validate_todos(raw.get("todos"))
+    summary = raw.get("summary", "")
+    if not isinstance(summary, str):
+        raise SessionCorruptError("invalid 'summary'")
     for key in ("created_at", "updated_at"):
         if not isinstance(raw.get(key), str):
             raise SessionCorruptError(f"invalid '{key}'")
     return SessionData(
         user_id, session_id, raw["version"], raw["next_turn"],
         [{"role": m["role"], "content": m["content"]} for m in history],
-        todos, raw["created_at"], raw["updated_at"],
+        todos, raw["created_at"], raw["updated_at"], summary,
     )
 
 

@@ -1,11 +1,13 @@
-"""带会话持久化的对话服务：加载历史与待办 → 运行 Agent → 原子保存，全程持有会话锁。"""
+"""带会话持久化与受限上下文管理的对话服务：加载历史与待办 → 构建上下文/压缩摘要 → 运行 Agent → 原子保存。"""
 from __future__ import annotations
 
 import json
 from typing import Callable
 
+from .context import build_context, refresh_summary_todos
 from .llm import LLMClient
 from .loop import OK, Agent, AgentResult
+from .prompt import build_system_prompt
 from .session import SessionManager
 from .tools.registry import ToolContext, ToolRegistry
 from .tools.todo import TodoStore
@@ -16,7 +18,7 @@ RegistryFactory = Callable[[TodoStore], ToolRegistry]
 
 
 class ChatService:
-    """把 Agent 与 SessionManager 串起来：一次 send 对应会话内的一轮对话。"""
+    """把 Agent、Context 与 SessionManager 串起来：一次 send 对应会话内的一轮对话。"""
 
     def __init__(
         self,
@@ -25,47 +27,69 @@ class ChatService:
         registry_factory: RegistryFactory,
         max_steps: int = 8,
         max_parse_retries: int = 3,
+        max_history_turns: int = 6,
+        max_context_tokens: int = 4000,
+        reserved_tokens: int = 1200,
     ):
-        """保存依赖；registry_factory 用会话恢复出的待办存储构建工具注册表。"""
+        """保存依赖及循环/上下文预算参数。"""
         self._llm = llm
         self._manager = manager
         self._factory = registry_factory
         self._max_steps = max_steps
         self._max_parse_retries = max_parse_retries
+        self._max_history_turns = max_history_turns
+        self._max_context_tokens = max_context_tokens
+        self._reserved_tokens = reserved_tokens
 
     def send(self, user_id: str, session_id: str, text: str, create: bool = False) -> AgentResult:
         """在会话内处理一轮输入并保存。
 
-        锁覆盖加载—执行—保存；Agent 失败（预算耗尽、解析失败、API 失败、内部错误）时同样保存历史与
-        已完成的待办操作；进程被中断时保存待办及本轮已发生的消息（含工具调用与 observation），再把异常继续抛出。
+        - 调用 Agent.run() 前通过 build_context 构建受限上下文（系统提示 + 摘要 + 最近 N 轮对话 + 本轮输入）；
+        - 区分完整持久化历史（data.history，用于会话回放）与发送给模型的有限上下文；
+        - 摘要随会话持久化（data.summary），并在工具执行后与待办存储实时对齐；
+        - 失败或中断退出时同样保存历史、摘要与已完成的待办操作。
         """
         with self._manager.open(user_id, session_id, create=create) as session:
             data = session.data
             ctx = ToolContext(user_id, session_id)
             store = TodoStore()
             store.load_state(ctx, data.todos)
-            agent = Agent(self._llm, self._factory(store), self._max_steps, self._max_parse_retries)
-            history = list(data.history)  # 不含 system 提示词，由 Agent 每轮重新生成
+            registry = self._factory(store)
+            ctx_plan = build_context(
+                system_prompt=build_system_prompt(registry),
+                history=data.history,
+                user_input=text,
+                existing_summary=data.summary,
+                todos=data.todos,
+                max_history_turns=self._max_history_turns,
+                max_context_tokens=self._max_context_tokens,
+                reserved_tokens=self._reserved_tokens,
+            )
+            data.summary = ctx_plan.summary
+            prefix_len = len(ctx_plan.messages) - 1  # 本轮 user_input 之前的上下文消息数
+            agent = Agent(self._llm, registry, self._max_steps, self._max_parse_retries)
             turn_id = session.next_turn_id()
             try:
-                result = agent.run(text, user_id, session_id, turn_id, history)
+                result = agent.run(text, user_id, session_id, turn_id, context_messages=ctx_plan.messages)
             except BaseException as e:
                 partial: AgentResult | None = getattr(e, "agent_result", None)
                 if partial is not None:
-                    new_messages = partial.messages[1 + len(history):]
+                    new_messages = partial.messages[prefix_len:]
                 else:  # 尚未进入循环就被中断
                     new_messages = [{"role": "user", "content": text}]
                 new_messages.append(_assistant_final(INTERRUPTED_NOTE))
                 data.history += new_messages
                 data.todos = store.export_state(ctx)
+                data.summary = refresh_summary_todos(data.summary, data.todos)
                 session.save()
                 raise
-            new_messages = result.messages[1 + len(history):]  # 去掉 system 与已有历史，只追加本轮新增
+            new_messages = result.messages[prefix_len:]  # 只追加本轮新增的原始消息，保留完整历史
             if result.status != OK:
                 # 失败提示作为 assistant 回复入历史，保持对话轮次完整，模型后续追问能知道发生了什么
                 new_messages.append(_assistant_final(result.answer))
             data.history += new_messages
             data.todos = store.export_state(ctx)
+            data.summary = refresh_summary_todos(data.summary, data.todos)
             session.save()
             return result
 
