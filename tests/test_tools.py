@@ -94,7 +94,9 @@ def test_calc_ok(expr, val):
 
 
 @pytest.mark.parametrize("expr", ["__import__('os')", "1+", "abs(1)", "a+1", "1/0", "2**100000", "'a'*3",
-                                  "(1).real", "1;2", "x" * 300])
+                                  "(1).real", "1;2", "x" * 300,
+                                  "(-1)**0.5", "(10**100)**10", "1e309", "((9**9)**9)**9", "10**101", "1e200*1e200",
+                                  "2**1001", "9**9**9", "0**-1"])
 def test_calc_rejects(expr):
     with pytest.raises(ToolError):
         calculate(expr)
@@ -134,12 +136,26 @@ def test_todo_errors(reg):
     assert not ok and "not found" in msg
 
 
-def test_todo_add_idempotent(reg):
+def test_todo_add_idempotent_within_same_turn(reg):
+    ctx = ToolContext("alice", "s1", turn_id=1)
+    run(reg, "todo", {"action": "add", "text": "same"}, ctx)
+    _, r = run(reg, "todo", {"action": "add", "text": "same"}, ctx)
+    assert r["created"] is False and r["item"]["id"] == 1
+    _, r = run(reg, "todo", {"action": "list"}, ctx)
+    assert len(r["items"]) == 1
+    assert "turn" not in r["items"][0]
+
+
+def test_todo_add_again_in_later_turn_creates_new(reg):
+    run(reg, "todo", {"action": "add", "text": "same"}, ToolContext("alice", "s1", turn_id=1))
+    _, r = run(reg, "todo", {"action": "add", "text": "same"}, ToolContext("alice", "s1", turn_id=2))
+    assert r["created"] is True and r["item"]["id"] == 2
+
+
+def test_todo_no_dedupe_without_turn_id(reg):
     run(reg, "todo", {"action": "add", "text": "same"})
     _, r = run(reg, "todo", {"action": "add", "text": "same"})
-    assert r["created"] is False and r["item"]["id"] == 1
-    _, r = run(reg, "todo", {"action": "list"})
-    assert len(r["items"]) == 1
+    assert r["created"] is True
 
 
 def test_todo_isolation_between_sessions_and_users(reg):
@@ -221,3 +237,25 @@ def test_live_weather():
 def test_live_search():
     ok, r = run(build_registry(Settings.from_env().tavily_api_key), "search", {"query": "python language", "max_results": 2})
     assert ok and r["results"]
+
+
+def test_result_serialization_failure_is_contained():
+    r = ToolRegistry()
+    r.register(Tool("nan", "d", {"type": "object", "properties": {}}, lambda a, c: {"v": float("nan")}))
+    r.register(Tool("cplx", "d", {"type": "object", "properties": {}}, lambda a, c: {"v": 1j}))
+    r.register(Tool("big", "d", {"type": "object", "properties": {}}, lambda a, c: {"v": 10 ** 5000}))
+    for name in ("nan", "cplx", "big"):
+        res = r.execute(name, {})
+        assert not res.ok and "serializable" in res.content
+
+
+def test_calculator_tool_end_to_end_rejections(reg):
+    for expr in ("(-1)**0.5", "(10**100)**10", "1e309"):
+        ok, msg = run(reg, "calculator", {"expression": expr})
+        assert not ok and isinstance(msg, str)
+
+
+def test_calculator_boundary_values_still_work():
+    assert calculate("10**100") == 10 ** 100
+    assert calculate("2**300") == 2 ** 300
+    assert calculate("1e100") == 1e100

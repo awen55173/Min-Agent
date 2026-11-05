@@ -9,10 +9,11 @@ from .registry import Tool, ToolError
 
 URL = "https://api.tavily.com/search"
 HttpPost = Callable[[str, dict, str], Any]  # (url, json_body, api_key) -> 已解析 JSON
-_SNIPPET_MAX = 300
+_SNIPPET_MAX = 300 # 返回摘要内容字数
 
 
 def _default_post(url: str, body: dict, api_key: str) -> Any:
+    """向 Tavily 发送 POST 并返回 JSON；失败转为 ToolError。"""
     try:
         r = httpx2.post(url, json=body, headers={"Authorization": f"Bearer {api_key}"}, timeout=30)
         r.raise_for_status()
@@ -22,6 +23,7 @@ def _default_post(url: str, body: dict, api_key: str) -> Any:
 
 
 def parse_results(data: Any) -> list[dict]:
+    """提取标题/URL/截断摘要；响应结构异常抛 ToolError。"""
     try:
         return [
             {
@@ -36,7 +38,10 @@ def parse_results(data: Any) -> list[dict]:
 
 
 def make_search_tool(api_key: str | None, http_post: HttpPost = _default_post) -> Tool:
+    """创建搜索工具；api_key 缺失时调用返回配置错误，http_post 可注入以便测试。"""
+
     def run(args: dict, ctx):
+        """执行搜索并返回精简结果。"""
         if not api_key:
             raise ToolError("search is not configured: TAVILY_API_KEY is missing")
         query = args["query"].strip()

@@ -13,6 +13,7 @@ HttpGet = Callable[[str], Any]  # 返回已解析的 JSON
 
 
 def _default_get(url: str) -> Any:
+    """请求 wttr.in 并返回 JSON；任何网络/解析失败转为 ToolError。"""
     try:
         r = httpx2.get(url, timeout=15, follow_redirects=True)
         r.raise_for_status()
@@ -37,7 +38,10 @@ def parse_weather(city: str, data: Any) -> dict:
 
 
 def make_weather_tool(http_get: HttpGet = _default_get) -> Tool:
+    """创建天气工具；http_get 可注入以便测试。"""
+
     def run(args: dict, ctx):
+        """查询城市当前天气。"""
         city = args["city"].strip()
         if not city:
             raise ToolError("city must not be empty")
