@@ -190,13 +190,49 @@ def test_same_turn_id_for_all_calls_dedupes_todo():
     assert '"created": false' in r.actions[1].result
     # 下一轮（新 turn_id）允许再次新增同名待办
     llm2 = FakeLLM([act("todo", action="add", text="x"), final("ok")])
-    r2 = Agent(llm2, reg).run("again", "u", "s", turn_id=r.turn_id + 1)
+    r2 = Agent(llm2, reg).run("again", "u", "s", turn_id="next-turn")
     assert '"created": true' in r2.actions[0].result
 
 
-def test_turn_id_increments_per_run(reg):
-    agent = Agent(FakeLLM([final("a"), final("b")]), reg)
-    assert agent.run("1").turn_id == 1 and agent.run("2").turn_id == 2
+def test_turn_ids_unique_across_runs_and_instances(reg):
+    a1, a2 = Agent(FakeLLM([final("a"), final("b")]), reg), Agent(FakeLLM([final("c")]), reg)
+    ids = {a1.run("1").turn_id, a1.run("2").turn_id, a2.run("3").turn_id}
+    assert len(ids) == 3
+
+
+def test_explicit_turn_id_does_not_collide_with_auto():
+    reg = build_registry(todo_store=TodoStore())
+    llm = FakeLLM([act("todo", action="add", text="x"), final("ok")] * 2)
+    Agent(llm, reg).run("a", "u", "s", turn_id=1)
+    r = Agent(llm, reg).run("b", "u", "s")  # 自动生成的 ID 不会等于显式的 1
+    assert '"created": true' in r.actions[0].result
+
+
+def test_two_run_once_sharing_registry_do_not_merge_todos():
+    reg = build_registry(todo_store=TodoStore())
+    for _ in range(2):
+        r = cli.run_once(FakeLLM([act("todo", action="add", text="same"), final("ok")]), "add same", reg)
+        assert '"created": true' in r.actions[0].result
+    from agent.tools import ToolContext
+    assert len(reg.get("todo").func({"action": "list"}, ToolContext())["items"]) == 2
+
+
+@pytest.mark.parametrize("blank", ["", " ", "\n\t  \n"])
+def test_blank_final_answer_goes_through_format_correction(reg, blank):
+    llm = FakeLLM([J(thought="t", final_answer=blank), final("真正的答案")])
+    r = Agent(llm, reg).run("q")
+    assert r.status == OK and r.answer == "真正的答案"
+    assert llm.calls[1][-1]["content"].startswith("Format error")
+
+
+def test_blank_final_answer_retries_exhausted(reg):
+    r = Agent(FakeLLM([J(final_answer="  ")] * 4), reg, max_parse_retries=3).run("q")
+    assert r.status == PARSE_EXHAUSTED
+
+
+def test_parse_blank_final_answer_error(reg):
+    with pytest.raises(ParseError, match="non-blank"):
+        parse_output(J(final_answer=" \n "), reg)
 
 
 def test_observation_truncated():

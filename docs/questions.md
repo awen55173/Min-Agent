@@ -22,3 +22,5 @@
 | 互斥冲突时可能误执行工具 | 先执行再检查 | 解析阶段拦截，冲突输出不执行任何工具并回填格式错误 |
 | PowerShell 中 `2>&1` 使 CLI 的 stderr 显示为 NativeCommandError | PowerShell 将 stderr 包装为错误记录 | 仅为显示问题，程序本身退出码 0 |
 | docs 下记录文件出现乱码 | 用 PowerShell 的 `Add-Content` / `Set-Content` 写入中文：Windows PowerShell 5 默认非 UTF-8 编码，且命令行中的中文在传入时已被破坏，事后无法恢复 | 重写受损条目；以后只用 write_file（UTF-8）或 Python 以 `encoding="utf-8"` 写文档，不再用 PowerShell 写中文 |
+| 连续两次 run_once 复用注册表时，第二次明确新增的同名待办被合并；显式 turn_id=1 与自动生成冲突 | 轮次号是 Agent 实例内的自增计数，不同实例、重启后都会从 1 开始 | 自动生成 `new_turn_id()`（uuid，全局唯一）；显式传入的 ID 由调用方保证会话内唯一，M3 由会话管理器分配并持久化 |
+| 仅含空白的 final_answer 被当作成功，返回空答案 | 解析器只判断了空字符串，strip 在判断之后 | `_present` 对字符串先 strip 再判断，空白视为未提供，走格式纠正与重试流程 |

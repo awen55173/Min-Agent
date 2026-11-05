@@ -7,7 +7,7 @@ from typing import Any
 from .llm import LLMClient, LLMError, Message
 from .parser import ParseError, parse_output
 from .prompt import build_system_prompt
-from .tools.registry import ToolContext, ToolRegistry
+from .tools.registry import ToolContext, ToolRegistry, TurnId, new_turn_id
 
 OK = "ok"
 MAX_STEPS = "max_steps"
@@ -37,7 +37,7 @@ class AgentResult:
     answer: str
     actions: list[ActionRecord] = field(default_factory=list)
     messages: list[Message] = field(default_factory=list)
-    turn_id: int | None = None
+    turn_id: TurnId | None = None
 
 
 def _summarize(actions: list[ActionRecord]) -> str:
@@ -57,20 +57,18 @@ class Agent:
         self._registry = registry
         self._max_steps = max_steps
         self._max_parse_retries = max_parse_retries
-        self._turn = 0
 
     def run(
         self,
         user_input: str,
         user_id: str = "default",
         session_id: str = "default",
-        turn_id: int | None = None,
+        turn_id: TurnId | None = None,
         history: list[Message] | None = None,
     ) -> AgentResult:
-        """处理一次用户输入并返回结果；整轮使用同一个 turn_id 供待办去重。"""
+        """处理一次用户输入并返回结果；整轮使用同一个 turn_id 供待办去重，未传入时自动生成全局唯一 ID。"""
         if turn_id is None:
-            self._turn += 1
-            turn_id = self._turn
+            turn_id = new_turn_id()
         ctx = ToolContext(user_id, session_id, turn_id)
         messages: list[Message] = [{"role": "system", "content": build_system_prompt(self._registry)}]
         messages += history or []

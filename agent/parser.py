@@ -60,8 +60,10 @@ def extract_json(text: str) -> dict:
 
 
 def _present(value: Any) -> bool:
-    """字段是否有效出现（None 与空字符串视为未提供）。"""
-    return value is not None and value != ""
+    """字段是否有效出现（None、空字符串或仅含空白的字符串视为未提供）。"""
+    if isinstance(value, str):
+        return bool(value.strip())
+    return value is not None
 
 
 def parse_output(text: str, registry: ToolRegistry) -> ParsedOutput:
@@ -75,7 +77,7 @@ def parse_output(text: str, registry: ToolRegistry) -> ParsedOutput:
     if has_action and has_final:
         raise ParseError("'action' and 'final_answer' are mutually exclusive; send only one of them")
     if not has_action and not has_final:
-        raise ParseError("output must contain either 'action' (+ 'action_input') or 'final_answer'")
+        raise ParseError("output must contain either 'action' (+ 'action_input') or a non-blank 'final_answer'")
 
     if has_final:
         answer = obj["final_answer"]

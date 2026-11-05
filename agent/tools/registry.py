@@ -2,8 +2,17 @@
 from __future__ import annotations
 
 import json
+import uuid
 from dataclasses import dataclass
 from typing import Any, Callable
+
+TurnId = str | int  # 对话轮次标识；同一会话内必须唯一
+
+
+def new_turn_id() -> str:
+    """生成全局唯一的轮次 ID（不依赖实例计数，重启、多实例、复用注册表都不会冲突）。"""
+    return f"turn-{uuid.uuid4().hex[:16]}"
+
 
 _TYPES: dict[str, tuple[type, ...]] = {
     "string": (str,),
@@ -23,7 +32,7 @@ class ToolContext:
 
     user_id: str = "default"
     session_id: str = "default"
-    turn_id: int | None = None
+    turn_id: TurnId | None = None
 
 
 @dataclass

@@ -4,7 +4,7 @@ from __future__ import annotations
 import threading
 from dataclasses import asdict, dataclass
 
-from .registry import Tool, ToolContext, ToolError
+from .registry import Tool, ToolContext, ToolError, TurnId
 
 
 @dataclass
@@ -14,7 +14,7 @@ class TodoItem:
     id: int
     text: str
     done: bool = False
-    turn: int | None = None
+    turn: TurnId | None = None
 
     def public(self) -> dict:
         """返回对模型可见的字段（不含内部 turn）。"""
