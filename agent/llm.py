@@ -26,7 +26,7 @@ class LLMClient(Protocol):
 class OpenAIClient:
     """调用兼容 OpenAI 的接口，支持自定义服务地址。"""
 
-    def __init__(self, settings: Settings, temperature: float = 0.0, backoff: float = 1.0):
+    def __init__(self, settings: Settings, temperature: float = 0.1, backoff: float = 1.0):
         """按配置创建客户端，并保存模型参数和重试策略。"""
         self._model = settings.model
         self._temperature = temperature

@@ -39,11 +39,12 @@ def test_fake_llm_records_and_exhausts():
         llm.chat([])
 
 
-def test_run_once_uses_client():
-    """验证用户输入传入客户端，并返回预设回复。"""
-    llm = FakeLLM(["pong"])
-    assert cli.run_once(llm, "ping") == "pong"
+def test_run_once_uses_agent_loop():
+    llm = FakeLLM(['{"thought": "t", "final_answer": "pong"}'])
+    result = cli.run_once(llm, "ping")
+    assert result.status == "ok" and result.answer == "pong"
     assert llm.calls[0][-1] == {"role": "user", "content": "ping"}
+    assert llm.calls[0][0]["role"] == "system"
 
 
 def test_cli_config_error_returns_1(clean_env, tmp_path, capsys, monkeypatch):
