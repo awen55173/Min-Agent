@@ -1,6 +1,7 @@
 """上下文管理：从会话历史选取最近轮次、剥离历史思考过程，并在超出轮数或 token 预算时生成结构化摘要。"""
 from __future__ import annotations
 
+import copy
 import json
 import re
 from dataclasses import dataclass, field
@@ -41,8 +42,21 @@ def estimate_tokens(text: str) -> int:
 
 
 def estimate_messages_tokens(messages: list[Message]) -> int:
-    """估算消息列表的总 token 数（含每条消息的角色与格式开销）。"""
-    return sum(4 + estimate_tokens(m.get("content", "")) for m in messages)
+    """估算消息列表的总 token 数（含每条消息的角色、内容及原生 tool_calls / tool_call_id 开销）。"""
+    total = 0
+    for m in messages:
+        total += 4 + estimate_tokens(str(m.get("content", "")))
+        tcs = m.get("tool_calls")
+        if isinstance(tcs, list):
+            for tc in tcs:
+                if isinstance(tc, dict):
+                    fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+                    total += 4 + estimate_tokens(str(tc.get("id", "")))
+                    total += estimate_tokens(str(fn.get("name", "")))
+                    total += estimate_tokens(str(fn.get("arguments", "")))
+        if m.get("role") == "tool":
+            total += 2 + estimate_tokens(str(m.get("tool_call_id", ""))) + estimate_tokens(str(m.get("name", "")))
+    return total
 
 
 def _clip_preserve_edges(text: str, max_chars: int) -> str:
@@ -119,7 +133,7 @@ def _strip_assistant_thought(content: str) -> str:
 
 
 def sanitize_turn(turn: list[Message]) -> list[Message]:
-    """清理单轮历史消息：移除格式错误重试噪音，并剥离 assistant 的历史 thought。"""
+    """清理单轮历史消息：移除格式错误重试噪音、剥离历史 thought，并保证原生 tool_calls 与 tool 结果成对。"""
     out: list[Message] = []
     i = 0
     while i < len(turn):
@@ -127,6 +141,7 @@ def sanitize_turn(turn: list[Message]) -> list[Message]:
         role, content = msg.get("role", ""), msg.get("content", "")
         if (
             role == "assistant"
+            and not msg.get("tool_calls")
             and i + 1 < len(turn)
             and turn[i + 1].get("role") == "user"
             and turn[i + 1].get("content", "").startswith("Format error: ")
@@ -137,11 +152,57 @@ def sanitize_turn(turn: list[Message]) -> list[Message]:
             i += 1
             continue
         if role == "assistant":
-            out.append({"role": "assistant", "content": _strip_assistant_thought(content)})
+            tcs = msg.get("tool_calls")
+            if isinstance(tcs, list) and tcs:
+                # 原生工具调用：剥离伴随调用的思考文本 content，完整保留 tool_calls
+                out.append({"role": "assistant", "content": "", "tool_calls": copy.deepcopy(tcs)})
+            else:
+                out.append({"role": "assistant", "content": _strip_assistant_thought(content)})
+        elif role == "tool":
+            tool_msg: Message = {
+                "role": "tool",
+                "tool_call_id": str(msg.get("tool_call_id", "")),
+                "content": content,
+            }
+            if msg.get("name"):
+                tool_msg["name"] = str(msg["name"])
+            out.append(tool_msg)
         else:
             out.append({"role": role, "content": content})
         i += 1
-    return out
+    return _ensure_tool_Pairs(out)
+
+
+def _ensure_tool_Pairs(messages: list[Message]) -> list[Message]:
+    """确保单轮内所有 assistant.tool_calls 都有配对的 role='tool' 结果消息，防止残缺配对导致 API 报错。"""
+    existing_tool_ids = {
+        str(m.get("tool_call_id", ""))
+        for m in messages
+        if m.get("role") == "tool" and m.get("tool_call_id")
+    }
+    healed: list[Message] = []
+    for m in messages:
+        healed.append(m)
+        tcs = m.get("tool_calls") if m.get("role") == "assistant" else None
+        if isinstance(tcs, list):
+            for tc in tcs:
+                if not isinstance(tc, dict):
+                    continue
+                tc_id = str(tc.get("id", ""))
+                fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+                t_name = str(fn.get("name", ""))
+                if tc_id and tc_id not in existing_tool_ids:
+                    existing_tool_ids.add(tc_id)
+                    healed.append({
+                        "role": "tool",
+                        "tool_call_id": tc_id,
+                        "name": t_name,
+                        "content": (
+                            f"Observation (tool={t_name}, status=interrupted): the run was interrupted while this "
+                            "tool was executing; it may or may not have taken effect."
+                        ),
+                    })
+    return healed
 
 
 def _add_unique(items: list[str], value: str) -> None:
@@ -425,12 +486,13 @@ def summarize_turns(
     existing_summary: str = "",
     todos: dict[str, Any] | None = None,
 ) -> StructuredSummary:
-    """从旧对话轮次和工具结果中提取结构化摘要（不保留历史 thought），并与已有摘要及待办存储对齐。"""
+    """从旧对话轮次和工具结果（兼容原生 tool_calls/tool 与文本 Observation）中提取结构化摘要，不保留历史 thought。"""
     summary = parse_summary(existing_summary)
     for turn in turns:
         user_text = ""
         final_answer = ""
         pending_args: dict[str, Any] = {}
+        native_calls: dict[str, tuple[str, dict[str, Any]]] = {}
         had_tool_fact = False
 
         for msg in turn:
@@ -450,10 +512,42 @@ def summarize_turns(
                     _add_unique(summary.user_goals, user_text)
                     for fact in _extract_user_facts(user_text):
                         _add_unique(summary.key_facts, fact)
+            elif role == "tool":
+                tc_id = str(msg.get("tool_call_id", ""))
+                tool_name, tool_args = native_calls.get(tc_id, (str(msg.get("name", "")), {}))
+                m = _OBS_RE.match(content)
+                if m:
+                    status, payload = m.group(2), m.group(3)
+                elif content.startswith("Error: "):
+                    status, payload = "error", content[7:]
+                else:
+                    status, payload = "ok", content
+                _extract_observation(tool_name, status, payload, tool_args, summary)
+                if status == "ok" and tool_name in ("weather", "calculator", "search"):
+                    had_tool_fact = True
             elif role == "assistant":
+                tcs = msg.get("tool_calls")
+                if isinstance(tcs, list) and tcs:
+                    # 原生工具调用消息：伴随的 content 属于当轮思考过程，绝不读取为长期记忆
+                    for tc in tcs:
+                        if not isinstance(tc, dict):
+                            continue
+                        tc_id = str(tc.get("id", ""))
+                        fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+                        t_name = str(fn.get("name", ""))
+                        raw_args = fn.get("arguments", "{}")
+                        try:
+                            parsed_args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+                        except ValueError:
+                            parsed_args = {}
+                        native_calls[tc_id] = (t_name, parsed_args if isinstance(parsed_args, dict) else {})
+                    continue
                 try:
                     obj = extract_json(content)
                 except ParseError:
+                    stripped = content.strip()
+                    if stripped and not stripped.startswith("{") and not stripped.startswith("```"):
+                        final_answer = stripped
                     continue
                 # 历史 thought 不作为长期记忆，此处绝不读取 obj["thought"]
                 if isinstance(obj.get("action"), str):

@@ -48,6 +48,7 @@
 | 正常恢复重试后，Trace 完整性检查返回 `valid=False` | 重试复用了同一个 `turn_id`，但新一次尝试的工具步数重新从 1 开始（如 `[1, 1]`），而原校验按 `turn_id` 汇总所有步数 | 为 Trace 事件增加 `attempt_id` 区分同一 `turn_id` 下的每次尝试，保持 `call_id` 跨尝试稳定用于幂等，并在 `verify_trace_integrity` 中按 `(turn_id, attempt_id)` 校验请求/结果配对、步数从 1 连续递增与终止事件 |
 | 原生工具调用响应中 `message.content` 可能为 `None`，原 `_extract` 会判定为空响应并抛 `LLMError` | 模型返回 `tool_calls` 时通常不填充文本 `content` | 新增 `LLMResponse(content, tool_calls)` 与 `_extract_response`，允许仅含 `tool_calls` 或仅含非空 `content` 的响应通过，仅当二者同时为空时抛 `LLMError`；并对不支持 `parallel_tool_calls` 参数的兼容服务端自动降级重试 |
 | 切换到原生工具调用主路径后，M0–M5 中大量使用纯文本 `FakeLLM(["not json", ...])` 的旧单元测试如何保持兼容 | 旧测试向 `FakeLLM` 注入自定义 JSON 字符串或故意损坏的非 JSON 文本以测试文本解析器 | `OpenAIClient` 与结构化 `FakeLLM` 标记 `supports_native_tools = True` 走原生主路径；同时保留 `tool_mode="text"` 显式兼容选项，并对仅提供纯字符串回复列表的旧模拟客户端自动兼容文本解析路径 |
+| 原生工具调用消息（`assistant.tool_calls` + `role="tool"`）在上下文压缩与历史回放时可能丢失配对或将思考过程带入长期记忆 | 原 `context.py` 和 `session.py` 仅认识 `user`/`assistant` 角色及 `Observation (tool=...)` 文本格式；且 OpenAI 协议要求 `assistant.tool_calls` 必须紧跟配对 `tool_call_id` 的 `role="tool"` 消息 | `session.py` 扩展校验 `assistant.tool_calls` 与 `role="tool"`；`context.py` 在 `sanitize_turn` 中清空 `tool_calls` 消息伴随的思考文本并通过 `_ensure_tool_Pairs` 保证请求与结果成对，在 `summarize_turns` 中通过 `tool_call_id` 关联工具名与参数提取事实和待办状态；`cli.py` 同步支持两种格式的回放 |
 
 ## 2026-11-05 评审修复验收
 

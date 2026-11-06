@@ -1,10 +1,12 @@
-"""命令行入口：支持用户、会话（新建/按 ID 恢复/列出）、Trace 查看与交互模式。"""
+"""命令行入口：支持用户、会话（新建/按 ID 恢复/列出）、Trace 查看、工具模式选择与交互模式。"""
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 import re
 import sys
+from typing import Any
 
 from agent.config import ConfigError, Settings
 from agent.context import DEFAULT_CONTEXT_TOKENS
@@ -19,9 +21,14 @@ from agent.trace import TraceLogger
 _OBS_RE = re.compile(r"^Observation \(tool=([^,]+), status=(ok|error|interrupted)\): (.*)$", re.S)
 
 
-def run_once(client: LLMClient, prompt: str, registry: ToolRegistry | None = None) -> AgentResult:
+def run_once(
+    client: LLMClient,
+    prompt: str,
+    registry: ToolRegistry | None = None,
+    tool_mode: str = "native",
+) -> AgentResult:
     """用 Agent 循环处理单次输入（无会话持久化）并返回完整结果。"""
-    return Agent(client, registry or build_registry()).run(prompt)
+    return Agent(client, registry or build_registry(), tool_mode=tool_mode).run(prompt)
 
 
 def _print_result(result: AgentResult, verbose: bool) -> None:
@@ -32,12 +39,13 @@ def _print_result(result: AgentResult, verbose: bool) -> None:
     print(result.answer)
 
 
-def _print_history(history: list[dict[str, str]], verbose: bool) -> None:
-    """回放会话历史中的用户提问与最终回复；verbose 时把历史工具调用输出到 stderr。"""
+def _print_history(history: list[dict[str, Any]], verbose: bool) -> None:
+    """回放会话历史中的用户提问与最终回复（兼容原生 tool_calls/tool 与旧版文本 JSON）；verbose 时回放工具调用。"""
     step = 0
     pending_args: dict = {}
+    native_calls: dict[str, tuple[str, dict]] = {}
     for msg in history:
-        role, content = msg.get("role"), msg.get("content", "")
+        role, content = msg.get("role"), str(msg.get("content", ""))
         if role == "user":
             m = _OBS_RE.match(content)
             if m:
@@ -50,10 +58,44 @@ def _print_history(history: list[dict[str, str]], verbose: bool) -> None:
                 continue
             step = 0
             print(f"you> {content}")
+        elif role == "tool":
+            if verbose:
+                step += 1
+                tc_id = str(msg.get("tool_call_id", ""))
+                tool, t_args = native_calls.get(tc_id, (str(msg.get("name", "")), {}))
+                m = _OBS_RE.match(content)
+                if m:
+                    ok = m.group(2) == "ok"
+                    res = m.group(3)
+                elif content.startswith("Error: "):
+                    ok = False
+                    res = content[7:]
+                else:
+                    ok = True
+                    res = content
+                print(f"[step {step}] {tool}({t_args}) ok={ok} -> {res}", file=sys.stderr)
         elif role == "assistant":
+            tcs = msg.get("tool_calls")
+            if isinstance(tcs, list) and tcs:
+                for tc in tcs:
+                    if not isinstance(tc, dict):
+                        continue
+                    tc_id = str(tc.get("id", ""))
+                    fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+                    t_name = str(fn.get("name", ""))
+                    raw_args = fn.get("arguments", "{}")
+                    try:
+                        parsed_args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+                    except ValueError:
+                        parsed_args = {}
+                    native_calls[tc_id] = (t_name, parsed_args if isinstance(parsed_args, dict) else {})
+                continue
             try:
                 obj = extract_json(content)
             except ParseError:
+                stripped = content.strip()
+                if stripped and not stripped.startswith("{") and not stripped.startswith("```"):
+                    print(stripped)
                 continue
             if isinstance(obj.get("action"), str):
                 pending_args = obj.get("action_input") if isinstance(obj.get("action_input"), dict) else {}
@@ -72,6 +114,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--list", action="store_true", help="列出该用户的会话 ID 后退出")
     p.add_argument("--trace", action="store_true", help="查看指定会话的 Trace 执行日志后退出")
     p.add_argument("--retry", action="store_true", help="显式作为上一轮未完成请求的恢复重试执行")
+    p.add_argument("--tool-mode", choices=["native", "text"], default="native",
+                   help="工具调用模式：native（默认原生函数调用）或 text（显式兼容文本 JSON）")
     p.add_argument("--data-dir", default="data", help="会话存储目录（默认 data）")
     p.add_argument("--trace-dir", default=None, help="Trace 日志目录（默认 <data-dir>/traces）")
     p.add_argument("--max-context-tokens", type=int, default=DEFAULT_CONTEXT_TOKENS,
@@ -115,6 +159,7 @@ def main(argv: list[str] | None = None) -> int:
             lambda store: build_registry(settings.tavily_api_key, todo_store=store),
             max_context_tokens=args.max_context_tokens,
             trace_logger=trace_logger,
+            tool_mode=args.tool_mode,
         )
         print(f"[session] user={args.user} id={session_id}", file=sys.stderr)
         create = not resume  # 新会话在首轮保存时落盘

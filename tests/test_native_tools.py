@@ -1,15 +1,20 @@
 """原生工具调用（Function Calling）测试：阶段 1 导出工具 Schema、统一模型响应结构与真实 API 支持验证。"""
 from __future__ import annotations
 
+from pathlib import Path
 import json
 import types
 import pytest
 
 from agent.config import ConfigError, Settings
+from agent.context import build_context
 from agent.llm import FakeLLM, LLMError, LLMResponse, OpenAIClient, ToolCallItem, normalize_llm_response
 from agent.loop import MAX_STEPS, OK, PARSE_EXHAUSTED, TOOL_NOT_EXECUTED, Agent
 from agent.prompt import build_native_system_prompt, build_system_prompt
+from agent.service import ChatService
+from agent.session import SessionCorruptError, SessionManager
 from agent.tools import TodoStore, build_registry
+import cli
 
 
 def test_registry_exports_openai_tools_schema():
@@ -279,3 +284,145 @@ def test_live_native_serial_closed_loop():
     assert any(a.tool == "calculator" and a.ok and a.api_call_id for a in res.actions)
     assert any(a.tool == "todo" and a.ok and a.api_call_id for a in res.actions)
     assert any(m.get("role") == "tool" for m in res.messages)
+
+
+# ---------------------------------------------------------------------------
+# 阶段 3：适配会话与上下文（持久化、历史回放、摘要压缩、api_call_id vs call_id、旧会话兼容）
+# ---------------------------------------------------------------------------
+
+
+def test_native_session_persistence_replay_and_call_id_distinction(tmp_path: Path, capsys):
+    """原生工具调用会话完整持久化 tool_calls 与 role=tool 消息，区分 api_call_id 与内部幂等 call_id，并支持 CLI 回放。"""
+    mgr = SessionManager(tmp_path / "sessions")
+    fake = FakeLLM([
+        {
+            "content": "内部思考：先添加待办",
+            "tool_calls": [{"id": "call_model_xyz", "name": "todo", "args": {"action": "add", "text": "买牛奶"}}],
+        },
+        "已为您添加待办：买牛奶（#1）。",
+    ])
+    svc = ChatService(fake, mgr, lambda s: build_registry(todo_store=s))
+    res = svc.send("alice", "s_native", "帮我记买牛奶", create=True)
+    assert res.status == OK
+    assert res.actions[0].api_call_id == "call_model_xyz"
+    assert res.actions[0].call_id.startswith("call-1-todo-")
+    assert res.actions[0].api_call_id != res.actions[0].call_id
+
+    with mgr.open("alice", "s_native") as s:
+        hist = s.data.history
+        assert len(hist) == 4  # user -> assistant(tool_calls) -> tool -> assistant(final)
+        assert hist[1]["role"] == "assistant"
+        assert hist[1]["tool_calls"][0]["id"] == "call_model_xyz"
+        assert hist[2]["role"] == "tool"
+        assert hist[2]["tool_call_id"] == "call_model_xyz"
+        assert hist[3] == {"role": "assistant", "content": "已为您添加待办：买牛奶（#1）。"}
+        rec = s.data.tool_calls[0]
+        assert rec["api_call_id"] == "call_model_xyz"
+        assert rec["call_id"] == res.actions[0].call_id
+
+        # 验证 CLI 历史回放（含 verbose 工具步骤输出）
+        cli._print_history(hist, verbose=True)
+        captured = capsys.readouterr()
+        assert "you> 帮我记买牛奶" in captured.out
+        assert "已为您添加待办：买牛奶（#1）。" in captured.out
+        assert "[step 1] todo({'action': 'add', 'text': '买牛奶'}) ok=True ->" in captured.err
+
+    # 损坏的 role=tool（缺 tool_call_id）应被识别为 SessionCorruptError
+    session_file = tmp_path / "sessions" / "alice" / "s_native.json"
+    raw = json.loads(session_file.read_text(encoding="utf-8"))
+    raw["history"][2] = {"role": "tool", "content": "{}"}
+    session_file.write_text(json.dumps(raw), encoding="utf-8")
+    with pytest.raises(SessionCorruptError):
+        with mgr.open("alice", "s_native"):
+            pass
+
+
+def test_native_context_compression_strips_thought_keeps_pairs_and_completes_todo(tmp_path: Path):
+    """原生工具调用历史触发压缩后：剥离历史思考文本，保留最近轮次的 tool_calls/tool 配对，并能在压缩后完成早期创建的待办。"""
+    mgr = SessionManager(tmp_path / "sessions")
+    fake = FakeLLM([
+        # Turn 1：查北京天气并添加待办 #1
+        {
+            "content": "隐藏思考过程_不应进入长期记忆_SECRET_THOUGHT_1",
+            "tool_calls": [{"id": "tc_w1", "name": "weather", "args": {"city": "Beijing"}}],
+        },
+        {
+            "content": "隐藏思考过程_SECRET_THOUGHT_2",
+            "tool_calls": [{"id": "tc_t1", "name": "todo", "args": {"action": "add", "text": "带伞去北京出差"}}],
+        },
+        "北京小雨 18°C，已添加待办 #1：带伞去北京出差。",
+        # Turn 2：纯对话（预算 5000 元）
+        "好的，已记下您的出差预算为 5000 元。",
+        # Turn 3：计算器
+        {
+            "content": "思考计算",
+            "tool_calls": [{"id": "tc_c3", "name": "calculator", "args": {"expression": "5000 - 1200"}}],
+        },
+        "扣除机票后还剩 3800 元。",
+        # Turn 4（此时 max_history_turns=2 触发压缩，Turn 1 被压缩进结构化摘要）：完成刚才那个待办
+        {
+            "content": "根据摘要中的待办 #1 标记完成",
+            "tool_calls": [{"id": "tc_t4", "name": "todo", "args": {"action": "complete", "id": 1}}],
+        },
+        "已将待办 #1（带伞去北京出差）标记为完成！",
+    ])
+    svc = ChatService(
+        fake,
+        mgr,
+        lambda s: build_registry(
+            todo_store=s,
+            http_get=lambda _u: {
+                "current_condition": [
+                    {"temp_C": "18", "FeelsLikeC": "17", "humidity": "80", "weatherDesc": [{"value": "Light rain"}]}
+                ]
+            },
+        ),
+        max_history_turns=2,
+    )
+    svc.send("u1", "s_comp", "查北京天气并记待办：带伞去北京出差", create=True)
+    svc.send("u1", "s_comp", "这次出差预算 5000 元")
+    svc.send("u1", "s_comp", "机票花了 1200，帮我算还剩多少")
+    r4 = svc.send("u1", "s_comp", "把刚才那个出差待办完成掉")
+    assert r4.status == OK
+
+    with mgr.open("u1", "s_comp") as s:
+        assert s.data.todos["items"][0]["done"] is True
+        assert "SECRET_THOUGHT" not in s.data.summary
+        assert "#1 [done/已完成] 带伞去北京出差" in s.data.summary
+        assert "天气 Beijing: 18°C" in s.data.summary
+
+    # 检查第 4 轮发给模型的上下文：最近轮次中的 assistant.tool_calls 思考文本已被清空，且与 role=tool 成对
+    sent_msgs = fake.calls[-1]
+    for idx, m in enumerate(sent_msgs):
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            assert "SECRET_THOUGHT" not in str(m.get("content", ""))
+            tc_id = m["tool_calls"][0]["id"]
+            assert sent_msgs[idx + 1]["role"] == "tool"
+            assert sent_msgs[idx + 1]["tool_call_id"] == tc_id
+
+
+def test_legacy_session_seamlessly_resumes_in_native_mode(tmp_path: Path):
+    """兼容旧会话数据：由旧版文本 JSON 模式持久化的会话，切换到原生工具调用模式后可无缝恢复并继续对话。"""
+    mgr = SessionManager(tmp_path / "sessions")
+    legacy_llm = FakeLLM([
+        '{"thought": "t", "action": "todo", "action_input": {"action": "add", "text": "旧会话待办"}}',
+        '{"thought": "d", "final_answer": "旧会话已添加 #1"}',
+    ])
+    svc_legacy = ChatService(legacy_llm, mgr, lambda s: build_registry(todo_store=s), tool_mode="text")
+    r_old = svc_legacy.send("u1", "legacy_s", "添加旧会话待办", create=True)
+    assert r_old.status == OK
+
+    # 使用原生模式的客户端恢复同一会话
+    native_llm = FakeLLM([
+        {
+            "content": "",
+            "tool_calls": [{"id": "call_native_complete", "name": "todo", "args": {"action": "complete", "id": 1}}],
+        },
+        "已在原生模式下完成旧会话的待办 #1。",
+    ])
+    svc_native = ChatService(native_llm, mgr, lambda s: build_registry(todo_store=s), tool_mode="native")
+    r_new = svc_native.send("u1", "legacy_s", "完成第一条待办")
+    assert r_new.status == OK
+    with mgr.open("u1", "legacy_s") as s:
+        assert s.data.todos["items"][0]["done"] is True
+        assert any(m.get("role") == "tool" for m in s.data.history)

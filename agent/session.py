@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 _ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
-_ROLES = {"user", "assistant"}  # 历史中不保存 system 提示词，由 Agent 每次动态生成
+_ROLES = {"user", "assistant", "tool"}  # 历史中不保存 system 提示词；支持原生 tool 角色与旧版 user/assistant
 
 
 class SessionError(Exception):
@@ -70,7 +70,7 @@ class SessionData:
     session_id: str
     version: int = 0
     next_turn: int = 1
-    history: list[dict[str, str]] = field(default_factory=list)
+    history: list[dict[str, Any]] = field(default_factory=list)
     todos: dict[str, Any] = field(default_factory=_empty_todos)
     created_at: str = field(default_factory=_now)
     updated_at: str = field(default_factory=_now)
@@ -154,6 +154,46 @@ def _validate_unfinished_turn(unfinished: Any) -> dict[str, Any] | None:
     return dict(unfinished)
 
 
+def _validate_history_message(m: Any) -> dict[str, Any]:
+    """校验并规范化单条会话历史消息（兼容旧版文本消息与原生 tool_calls / tool 消息）。"""
+    if not isinstance(m, dict) or m.get("role") not in _ROLES or not isinstance(m.get("content"), str):
+        raise SessionCorruptError(f"invalid history message: {m!r}")
+    role = m["role"]
+    out: dict[str, Any] = {"role": role, "content": m["content"]}
+    if role == "assistant" and m.get("tool_calls") is not None:
+        tcs = m["tool_calls"]
+        if not isinstance(tcs, list) or not tcs:
+            raise SessionCorruptError(f"invalid assistant tool_calls: {m!r}")
+        norm_tcs: list[dict[str, Any]] = []
+        for tc in tcs:
+            fn = tc.get("function") if isinstance(tc, dict) else None
+            ok = (
+                isinstance(tc, dict)
+                and isinstance(tc.get("id"), str) and bool(tc["id"])
+                and tc.get("type", "function") == "function"
+                and isinstance(fn, dict)
+                and isinstance(fn.get("name"), str) and bool(fn["name"])
+                and isinstance(fn.get("arguments"), str)
+            )
+            if not ok:
+                raise SessionCorruptError(f"invalid tool_call entry in history: {tc!r}")
+            norm_tcs.append({
+                "id": tc["id"],
+                "type": "function",
+                "function": {"name": fn["name"], "arguments": fn["arguments"]},
+            })
+        out["tool_calls"] = norm_tcs
+    elif role == "tool":
+        tc_id = m.get("tool_call_id")
+        name = m.get("name", "")
+        if not isinstance(tc_id, str) or not tc_id or not isinstance(name, str):
+            raise SessionCorruptError(f"invalid tool message in history: {m!r}")
+        out["tool_call_id"] = tc_id
+        if name:
+            out["name"] = name
+    return out
+
+
 def validate_session_dict(raw: Any, user_id: str, session_id: str) -> SessionData:
     """校验文件内容并转为 SessionData；标识须与路径一致，任何不符抛 SessionCorruptError。"""
     if not isinstance(raw, dict):
@@ -167,9 +207,7 @@ def validate_session_dict(raw: Any, user_id: str, session_id: str) -> SessionDat
     history = raw.get("history")
     if not isinstance(history, list):
         raise SessionCorruptError("invalid 'history'")
-    for m in history:
-        if not (isinstance(m, dict) and m.get("role") in _ROLES and isinstance(m.get("content"), str)):
-            raise SessionCorruptError(f"invalid history message: {m!r}")
+    norm_history = [_validate_history_message(m) for m in history]
     todos = _validate_todos(raw.get("todos"))
     summary = raw.get("summary", "")
     if not isinstance(summary, str):
@@ -181,7 +219,7 @@ def validate_session_dict(raw: Any, user_id: str, session_id: str) -> SessionDat
             raise SessionCorruptError(f"invalid '{key}'")
     return SessionData(
         user_id, session_id, raw["version"], raw["next_turn"],
-        [{"role": m["role"], "content": m["content"]} for m in history],
+        norm_history,
         todos, raw["created_at"], raw["updated_at"], summary,
         tool_calls, unfinished_turn,
     )
