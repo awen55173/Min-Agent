@@ -31,3 +31,4 @@
     - 小阶段 5（增加受控并行调度）：支持单次响应返回多个 `tool_calls`（`parallel_tool_calls=True`），通过受控分段（`_partition_batch_segments`）与 `asyncio.Semaphore(max_concurrency)` 仅并发执行无依赖只读工具（`weather`/`search`/`calculator`），同一会话的待办写操作（`add`/`complete`/`delete`）及同批相关读写（`todo.list`）保持严格串行并立即落盘；单项超时或错误独立记录结果，不中断同批其他调用。
     - 小阶段 6（完善恢复、Trace 与测试）：并行乱序完成的工具结果按请求顺序精准绑定各自的模型 `api_call_id` 与内部幂等 `call_id`，批量调用逐个计入 `max_steps` 预算；复用 M5 写操作即时落盘、跨尝试稳定的 `call_id` 幂等恢复与 `attempt_id` Trace 校验，补齐部分失败、中途取消（`CancelledError`）、重启恢复及真实 API 并发/串行验收测试。
 19. 修复同步工具直接运行阻塞异步循环及超时失效；原生调用的上下文预算同时计入消息与工具 Schema；实现仅从用户明确输入维护当前 session 的可更新、可删除记忆，并在相关提问前按需召回。遵循 task_list.md、PLAN.md，补齐回归与全量测试，更新说明并提交 Git commit。
+20. 修复记忆提取误判：无问号提问不得覆盖城市，姓名中的“为”不得拆分成字段；整条输入含“不记忆”、示例、引用、假设或否定时不得自动写入。统一姓名别名与“按刚才的要求”指代召回，保留仍有效的历史用户声明；补充回归测试、更新问题记录并提交 Git commit。

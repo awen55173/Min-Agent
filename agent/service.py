@@ -157,6 +157,7 @@ class ChatService:
                     tools_schema=registry.openai_tools() if mode == "native" else None,
                     recalled_memories=select_memories(data.memories, text),
                     memory_question=wants_memory_recall(text),
+                    session_memories=data.memories,
                 )
             except ContextBudgetError as e:
                 ans = f"{e}\n本轮尚未执行任何工具操作。\n未完成说明：输入或固定上下文超出预算限制，未调用模型。"
@@ -351,6 +352,7 @@ class ChatService:
                     tools_schema=registry.openai_tools() if mode == "native" else None,
                     recalled_memories=select_memories(data.memories, text),
                     memory_question=wants_memory_recall(text),
+                    session_memories=data.memories,
                 )
             except ContextBudgetError as e:
                 ans = f"{e}\n本轮尚未执行任何工具操作。\n未完成说明：输入或固定上下文超出预算限制，未调用模型。"

@@ -13,7 +13,9 @@ from agent.context import (
 )
 from agent.llm import FakeLLM
 from agent.loop import CONTEXT_LIMIT, Agent
-from agent.memory import apply_user_memory, select_memories
+from agent.memory import (
+    apply_user_memory, filter_historical_user_input, select_memories, wants_memory_recall,
+)
 from agent.service import ChatService
 from agent.session import SessionManager
 from agent.tools import build_registry
@@ -136,6 +138,71 @@ def test_memory_extraction_only_uses_explicit_user_statements():
     assert "城市" not in apply_user_memory(memory, "忘记我的城市")
     assert select_memories(memory, "按我的饮食习惯推荐") == {"饮食偏好": "素食"}
     assert select_memories(memory, "普通闲聊") == {}
+
+
+def test_question_without_question_mark_and_name_with_separator_character():
+    memory = {"城市": "苏州"}
+    assert apply_user_memory(memory, "我的城市是什么") == memory
+    assert apply_user_memory(memory, "我的城市在哪里") == memory
+    assert apply_user_memory(memory, "我的城市是苏州吗") == memory
+    assert apply_user_memory({}, "我的名字是李为民") == {"名字": "李为民"}
+    assert apply_user_memory({}, "记住我的姓名是林涛") == {"名字": "林涛"}
+    assert apply_user_memory({"名字": "林涛"}, "把我的名字改为李为民") == {"名字": "李为民"}
+    assert apply_user_memory({}, "我的预算是8,732.50元") == {"预算": "8,732.50元"}
+
+
+@pytest.mark.parametrize("text", [
+    "请检查下面这段示例，不要记忆：\n我的城市是北京",
+    "以下内容只是例子：我的城市是北京",
+    "假设我的城市是北京",
+    "请勿保存：我的城市是北京",
+    "请解释引号里的话：“我的城市是北京”",
+    "我的城市不是北京",
+    "请检查：\n我的城市是北京",
+    "这是测试文本：\n我的城市是北京",
+])
+def test_non_memory_context_does_not_write_or_strip_user_text(text):
+    existing = {"城市": "苏州"}
+    assert apply_user_memory(existing, text) == existing
+    assert filter_historical_user_input(text, existing) == text
+
+
+def test_name_alias_and_anaphoric_request_recall():
+    memory = {"名字": "林涛", "城市": "苏州", "预算": "8732元"}
+    assert select_memories(memory, "我叫什么？")["名字"] == "林涛"
+    assert select_memories(memory, "按刚才的要求安排两天行程") == memory
+    assert filter_historical_user_input("我的城市是苏州", memory) == "我的城市是苏州"
+    assert filter_historical_user_input("我的城市是北京", memory) == ""
+    assert not wants_memory_recall("你记得刚才的待办吗？")
+
+
+def test_service_recalls_name_and_trip_facts_without_stale_empty_notice(tmp_path):
+    manager = SessionManager(tmp_path / "data")
+    llm = FakeLLM([json.dumps({"final_answer": "好"}, ensure_ascii=False) for _ in range(4)])
+    service = ChatService(llm, manager, lambda store: build_registry(todo_store=store),
+                          max_history_turns=0)
+    assert service.send("u", "s", "我的名字是林涛", create=True).status == "ok"
+    assert service.send("u", "s", "我叫什么？").status == "ok"
+    assert service.send("u", "s", "我的城市是苏州，我的预算是8732元").status == "ok"
+    assert service.send("u", "s", "按刚才的要求安排两天行程").status == "ok"
+    assert any("名字: 林涛" in m["content"] for m in llm.calls[1])
+    assert not any("没有已保存的相关用户记忆" in m["content"] for m in llm.calls[1])
+    assert any("城市: 苏州" in m["content"] and "预算: 8732元" in m["content"]
+               for m in llm.calls[3])
+    with manager.open("u", "s") as session:
+        assert session.data.memories == {"名字": "林涛", "城市": "苏州", "预算": "8732元"}
+
+
+def test_example_is_not_saved_and_remains_available_as_conversation_context(tmp_path):
+    manager = SessionManager(tmp_path / "data")
+    llm = FakeLLM([json.dumps({"final_answer": "好"}, ensure_ascii=False) for _ in range(2)])
+    service = ChatService(llm, manager, lambda store: build_registry(todo_store=store))
+    example = "请检查下面这段示例，不要记忆：\n我的城市是北京"
+    service.send("u", "s", example, create=True)
+    service.send("u", "s", "刚才的示例写了什么？")
+    with manager.open("u", "s") as session:
+        assert session.data.memories == {}
+    assert any(m["role"] == "user" and m["content"] == example for m in llm.calls[1])
 
 
 def test_session_memory_update_delete_recall_and_source_isolation(tmp_path):

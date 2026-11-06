@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .llm import Message
-from .memory import strip_memory_declarations
+from .memory import filter_historical_user_input, strip_memory_declarations
 from .parser import ParseError, extract_json
 
 _OBS_RE = re.compile(r"^Observation \(tool=([^,]+), status=(ok|error|interrupted)\): (.*)$", re.S)
@@ -142,11 +142,11 @@ def _strip_assistant_thought(content: str) -> str:
     return json.dumps(cleaned, ensure_ascii=False)
 
 
-def sanitize_turn(turn: list[Message]) -> list[Message]:
-    """清理单轮历史消息：移除格式错误重试噪音、剥离历史 thought，并保证原生 tool_calls 与 tool 结果成对。"""
+def sanitize_turn(turn: list[Message], memories: dict[str, str] | None = None) -> list[Message]:
+    """清理历史噪音与过期记忆声明，保留有效消息和工具配对。"""
     if turn and _is_turn_start(turn[0]):
         original = turn[0].get("content", "")
-        if original and not strip_memory_declarations(original) and all(
+        if original and not filter_historical_user_input(original, memories) and all(
             m.get("role") == "assistant" and not m.get("tool_calls") for m in turn[1:]
         ):
             return []
@@ -184,7 +184,7 @@ def sanitize_turn(turn: list[Message]) -> list[Message]:
                 tool_msg["name"] = str(msg["name"])
             out.append(tool_msg)
         else:
-            out.append({"role": role, "content": strip_memory_declarations(content)
+            out.append({"role": role, "content": filter_historical_user_input(content, memories)
                         if role == "user" and _is_turn_start(msg) else content})
         i += 1
     return _ensure_tool_Pairs(out)
@@ -624,10 +624,11 @@ def build_context(
     tools_schema: list[dict[str, Any]] | None = None,
     recalled_memories: dict[str, str] | None = None,
     memory_question: bool = False,
+    session_memories: dict[str, str] | None = None,
 ) -> ContextPlan:
     """按消息、用户记忆及工具定义预算构建受限上下文，不修改历史原文。"""
     turns = split_into_turns(history)
-    sanitized_turns = [sanitize_turn(t) for t in turns]
+    sanitized_turns = [sanitize_turn(t, session_memories) for t in turns]
     all_recent = [m for t in sanitized_turns for m in t]
 
     sys_msg: Message = {"role": "system", "content": system_prompt}
