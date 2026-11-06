@@ -3,8 +3,8 @@
 > 依据 `task_list.md`。原则：先跑通主链路，再逐步完善；不使用 langgraph/openhands 等 Agent 框架，核心 Runtime 自研；使用真实 LLM API（配置见 `.env`）。
 
 ## 1. 技术选型
-- 语言：Python 3.11+，依赖尽量少：`openai`（OpenAI 兼容客户端）、`httpx`/`requests`、`python-dotenv`、`pytest`。
-- LLM 仅作为"文本补全"来源，循环、解析、工具调度、会话、上下文均自行实现。
+- 语言：Python 3.11+，以 `pyproject.toml` / `uv.lock` 锁定 `openai`（OpenAI 兼容客户端）、`httpx2`、`python-dotenv`、`pytest`。
+- LLM 仅提供模型响应，循环、解析、工具调度、会话、上下文均自行实现；默认走 OpenAI-compatible 原生 function calling，并保留文本 JSON 兼容模式。
 - 持久化：JSON 文件（每个 session 一个文件），见 3.4。
 
 ## 2. 目录结构（规划）
@@ -37,18 +37,19 @@ min_agent/
 ### 3.1 Agent 循环（`loop.py`）
 ```
 while 预算充足(步数 / token / 重试次数):
-    输出 = 模型根据当前 context 回答        # 先同步实现，后续可改 async
+    检查 messages 与原生 tools Schema 总预算
+    输出 = 模型根据当前 context 回答
     if 输出表示回答结束(final_answer):
         if 输出格式或内容校验失败:
             把校验错误回填给模型; continue   # 消耗重试预算
         return 最终回答
     # 否则为工具调用请求
-    结果 = 执行工具(同步，后续可扩展异步/并行)
+    结果 = 校验后执行工具（异步；独立只读工具受控并行，写操作串行）
     校验工具输出(类型、长度截断)，作为 observation 回填 context
 预算耗尽 → 走 3.6 的失败处理
 ```
 - 终止条件：得到合法最终答案 / 预算耗尽 / 不可恢复错误。
-- 后续补充（不在首版展开）：异步与并行工具调用、流式输出。
+- 已实现：同步/异步调用、受控并行、超时状态区分；未实现：流式输出。
 
 ### 3.2 工具注册与调用
 - `@tool(name, description, parameters_schema)` 注册；registry 生成 schema 注入 prompt，由 LLM 自主决策。
@@ -60,7 +61,7 @@ while 预算充足(步数 / token / 重试次数):
   - `weather`：请求 `https://wttr.in/{city}?format=j1`，提取当前温度、天气描述、体感、湿度等精简字段；设置超时，失败返回可读错误。
 
 ### 3.3 输出解析与格式规则（`parser.py`）
-约定 JSON 输出，字段：`thought`、`action`（工具名）、`action_input`（对象）、`final_answer`；兼容 markdown 代码块包裹。
+native 主路径使用 OpenAI `tool_calls` / `role=tool` 关联协议；text 兼容模式约定 JSON 输出，字段为 `thought`、`action`（工具名）、`action_input`（对象）、`final_answer`，兼容 markdown 代码块包裹。
 
 | 情况 | 处理 |
 |---|---|
@@ -79,6 +80,7 @@ while 预算充足(步数 / token / 重试次数):
 - **原子写入**：写临时文件 → `flush + fsync` → `os.replace` 覆盖，避免中途崩溃产生半截文件。
 - **同一 session 同时打开**：每个 session 使用文件锁（lock 文件，含超时）；第二个进程/窗口获取不到锁时，明确提示"该会话正被占用"并拒绝写入（只读或稍后重试），不静默覆盖；进程内另用 `threading.Lock`。文件中带 `version` 字段，写前校验，作为兜底。
 - 重启后按 id 加载继续对话。
+- 已实现显式会话记忆 `memories`：只从本轮用户原文解析姓名、城市、预算、偏好等白名单字段的设置、更新、删除；按字段别名或明确指代按需注入，助手回答与工具结果不作为用户记忆。
 
 ### 3.5 Context 管理
 - 保留：用户输入、最终答案、工具调用及结果（支持带工具追问）；思考过程只保留当前轮，历史轮丢弃以省 token。
@@ -91,6 +93,7 @@ while 预算充足(步数 / token / 重试次数):
   - 未完成事项。
   摘要先用规则按字段抽取（工具调用结果中的 ID/参数直接结构化保存），后续可选 LLM 摘要。
 - 状态型数据（todo 列表）以工具实时读取为准，不依赖历史记忆。
+- **显式会话记忆**：`SessionData.memories` 只接收当前用户输入中匹配白名单字段（姓名、城市、预算、偏好等）的明确设置、更新或删除命令；忽略疑问、否定、引用、示例和“不记忆”输入。按字段别名/明确指代选取少量事实，在 system prompt 之后、摘要之前注入；历史答案、工具 Observation 不写入用户记忆。当前没有跨 session 长期记忆或 LLM 候选提取。
 - 摘要先从完整输入与回答提取金额、地点和偏好等短字段，再收缩文本；摘要中的待办按条数和文本长度受限，省略时明确提示调用 `todo.list` 读取完整 ID 与实时状态，完整存储不会被删减。单条 Observation 限制为 2000 估算 tokens，截断时显式标记并提示分批查询。
 - 必须有测试："压缩后仍能完成刚才那个待办"。
 
@@ -122,7 +125,7 @@ while 预算充足(步数 / token / 重试次数):
 | M3 | SessionManager、原子写入、锁、CLI 多窗口 | session 隔离与并发测试通过 |
 | M4 | Context：限制、追问、结构化压缩 | 压缩后追问测试通过 |
 | M5 | 失败处理、幂等、trace | 异常场景测试通过 |
-| M6 | README、docs、真实 API 跑通核心流程、上传 GitHub | 文档完整 |
+| M6 | README、docs、本地验收与发布准备 | 文档、常规及 live 核心流程通过；GitHub 发布由仓库维护者决定 |
 
 ## 5. 测试计划
 默认用 FakeLLM（脚本化输出）+ Fake 搜索/天气，保证确定性。
@@ -138,11 +141,15 @@ while 预算充足(步数 / token / 重试次数):
 - 真实 API 测试：标记 `@pytest.mark.live`，默认跳过；**交付前必须至少实际运行一次核心流程**（真实 LLM + 工具 + 追问），并把结果记入 README 或 questions。
 
 ## 6. 后续完善方向
-- 原生 function calling 作为备选路径；异步/并行工具调用。
-- LLM 摘要式压缩、长期 memory 召回。
-- 更多工具与流式输出。
+- 未实现：LLM 摘要、跨 session 长期/语义记忆、结构化候选事实确认流程、后台任务与完成通知、流式输出。
+- 可继续扩充白名单记忆字段和工具，但保留用户原文依据及显式写入边界。
 
-## 7. 交付物清单
+## 7. 当前实现状态
+- 已实现并经常规测试验收：M0–M5 核心链路、原生工具调用、异步/并行调度、结构化上下文管理、会话记忆和恢复/Trace。
+- 本地文档、配置与真实 API 验收按 `README.md`、`架构设计.md` 和 `docs/questions.md` 维护。
+- 尚未执行 GitHub 发布/上传；本仓库保留为本地交付，供维护者自行审阅和推送。
+
+## 8. 交付物清单
 - GitHub 代码仓库。
 - README：运行方式、系统设计、memory 召回时机与放置方式（历史 → messages，摘要 → system 之后，状态 → 工具实时读取）。
 - `docs/prompts.md`（AI Prompt 记录）与 `docs/questions.md`（问题解决记录），两者分开。

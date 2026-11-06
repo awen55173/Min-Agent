@@ -276,3 +276,36 @@ def test_async_service_persists_and_recalls_user_memory(tmp_path):
     assert all("苏州" not in m["content"] for m in llm.calls[1])
     with manager.open("u", "s") as session:
         assert session.data.memories == {}
+
+
+@pytest.mark.live
+def test_live_session_memory_create_update_delete_and_recall(tmp_path):
+    """真实模型验收：显式添加、按字段召回、更新和删除当前会话记忆。"""
+    from agent.config import ConfigError, Settings
+    from agent.llm import OpenAIClient
+
+    try:
+        llm = OpenAIClient(Settings.from_env())
+    except ConfigError as error:
+        pytest.skip(f"LLM env not configured: {error}")
+
+    manager = SessionManager(tmp_path / "data")
+    service = ChatService(llm, manager, lambda store: build_registry(todo_store=store))
+    assert service.send("u", "memory_live", "记住我的名字是Codex验收用户", create=True).status == "ok"
+    recalled = service.send("u", "memory_live", "我叫什么？")
+    assert any("名字" in message["content"] and "Codex验收用户" in message["content"]
+               for message in recalled.messages if message["role"] == "system")
+
+    assert service.send("u", "memory_live", "把我的名字改成验收更新用户").status == "ok"
+    updated = service.send("u", "memory_live", "我叫什么？")
+    assert any("验收更新用户" in message["content"] for message in updated.messages
+               if message["role"] == "system")
+    assert all("Codex验收用户" not in message["content"] for message in updated.messages
+               if message["role"] == "system")
+
+    assert service.send("u", "memory_live", "忘记我的名字").status == "ok"
+    deleted = service.send("u", "memory_live", "我叫什么？")
+    assert any("没有已保存的相关用户记忆" in message["content"] for message in deleted.messages
+               if message["role"] == "system")
+    with manager.open("u", "memory_live") as session:
+        assert session.data.memories == {}

@@ -76,3 +76,11 @@
 
 - 默认测试集：311 passed、11 skipped；覆盖无问号提问、姓名内部“为”、小数及千分位预算、不记忆和示例语境、姓名别名、行程指代、历史有效声明与示例回放。
 - 真实 API 核心流程：tests/test_review_regressions.py 的 live 验收 1 passed、20 deselected。
+
+## 2026-11-06 本地交付文档与最终验收
+
+- 文档按代码现状补充安装、配置、CLI 会话恢复、native/text 模式、并发范围、重试、Trace、记忆召回和未实现功能；PLAN 与架构说明区分已交付行为及后续方向。
+- 配置核对：`.env.example` 只含占位密钥；`pyproject.toml` 与 `uv.lock` 提供可复现依赖；`.gitignore` 忽略 `.env`、`data/`、`logs/`、虚拟环境和测试缓存。`git ls-files .env data logs '*.jsonl'` 无输出，没有跟踪密钥或会话/Trace 文件。
+- 常规测试：`.venv/Scripts/python.exe -m pytest -q`，311 passed、12 skipped（所有真实 API 场景不在默认集执行）。
+- 真实 API：`.venv/Scripts/python.exe -m pytest -q -m live`，12 passed、311 deselected。覆盖原生调用闭环、并行天气独立查询、天气后待办依赖操作、待办写入/完成及 Trace、失败写入恢复与真实模型下记忆新增/更新/删除及召回。
+- 外部服务限制：并行天气验收使用真实模型决策，但通过注入稳定的异步天气响应隔离 wttr.in 的外部波动；LLM 验收使用本机 `.env` 所指服务与模型。项目估算 token 和记忆白名单规则分别不保证等同模型精确计数及任意自然语言覆盖。
