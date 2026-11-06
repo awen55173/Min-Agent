@@ -53,8 +53,17 @@
 | 模型一次返回多个 `tool_calls` 时，若无差别并发执行可能导致同一会话的待办写操作竞争、读写顺序错乱（如 `add` 与 `complete`/`list` 乱序）或单项超时拖垮整批查询 | 缺乏读写属性区分与并发度控制，且若异常直接抛出将取消同批已完成或进行中的独立只读查询 | 新增 `_is_parallel_safe` 与 `_partition_batch_segments`：仅将连续无依赖只读工具合并为 `parallel` 段并在 `asyncio.Semaphore(max_concurrency)` 下并发执行；待办写操作及含写操作批次中的 `todo.list` 均切分为 `serial` 段严格按序串行执行并即时落盘；单项超时或工具错误由 `aexecute` 封装为 `ToolResult(ok=False)`，完整保留同批其他成功结果 |
 | 并行批次中各工具完成顺序不确定、中途被取消（`CancelledError`）或写入成功后模型失败重试时，可能导致消息配对残缺、预算漏计或 Trace 校验失败 | 并发任务按完成先后返回，若直接追加会导致顺序漂移；中途取消时未完成项若缺 `role="tool"` 消息或 `tool_result` 事件会破坏协议与 Trace 配对；重试时模型生成的 `api_call_id` 会变化 | 在 `_prepare_batch_items` 中按单次调用逐个扣减 `max_steps` 预算并预分配确定性 `step` 与稳定 `call_id`；并发段内按实际完成时刻记录 `tool_result` Trace，随后按原请求顺序回填 `role="tool"` 消息与 `ActionRecord`；中途取消时在 `_prepare_interrupted_state` 中保留已完成项并把未完成项补齐 `status=interrupted` 的消息与 Trace；恢复重试时通过稳定 `call_id` 复用已落盘写操作并绑定新 `api_call_id` |
 
+| 同步工具在 aexecute 中直接执行，超时也无法打断阻塞调用 | 工具函数占用事件循环，wait_for 无机会触发；超时后线程副作用状态需要区分 | 同步函数改用 asyncio.to_thread。只读调用超时返回 unknown_after_timeout 并说明后台可能仍运行；写调用使用串行锁，超时或取消后先等实际执行结束，再返回真实结果及 completed_after_timeout 状态，避免重复写入与竞态。新增事件循环、超时和串行回归测试 |
+| 原生调用的预算仅统计 messages，漏算单独发送的 tools Schema | build_context 和请求前检查未包含原生工具定义 | 统一估算工具 Schema；会话构建、同步及异步原生请求前检查同一份 Schema，超限返回 context_limit 且不调用模型。新增构建阶段、首轮和工具结果后续轮次回归 |
+| 会话中缺少可更新、可删除的用户记忆，历史答案或工具结果容易被误当用户事实 | 之前只有混合来源的对话摘要，没有独立的用户事实存储与召回条件 | 新增 session.memories，仅从当前用户明确声明解析设置、修改、删除；相关问题才注入系统消息，历史回放剔除旧记忆声明。模型回答和工具结果不写入该字段；测试覆盖来源隔离、跨 session、更新、删除与重启召回 |
+
 ## 2026-11-05 评审修复验收
 
 - 真实 API：`.venv/Scripts/python.exe -m pytest -q -m live tests/test_review_regressions.py`，1 passed；真实 LLM 调用 todo 添加待办，随后在强制压缩历史后追问并实际完成该待办，校验持久化 done 状态。
 - 确定性回归覆盖 4000 token 小预算、大量长待办、连续工具结果、格式纠错预算、超长系统/输入拒绝调用、默认 16000 预算、末尾关键字段保留及非法工具输出隔离。
 - 最终验证：默认测试集 254 passed、7 skipped（真实 API 测试默认跳过）；单独真实 API 验收 1 passed、20 deselected。记录与文档按 UTF-8 保存。
+
+## 2026-11-06 工具超时、原生预算与会话记忆验收
+
+- 默认测试集：299 passed、11 skipped；新增回归覆盖同步只读超时不阻塞循环、写工具超时与取消后的串行状态、原生 Schema 预算首轮及工具结果后续轮次、记忆来源隔离与更新删除。
+- 真实 API 核心流程：tests/test_review_regressions.py 的 live 验收 1 passed、20 deselected，完成待办写入及压缩后追问。

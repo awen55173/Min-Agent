@@ -30,3 +30,4 @@
     - 小阶段 4（改造异步执行链）：将模型请求（`acomplete`/`achat`）、搜索（`search`）、天气（`weather`）及主循环（`Agent.arun`）、对话服务（`ChatService.asend`）改造为异步调用；统一超时、取消传播（`CancelledError`）与退避重试；改造会话锁（`aopen`）与保存（`asave`）为非阻塞异步操作，避免阻塞其他并发会话。
     - 小阶段 5（增加受控并行调度）：支持单次响应返回多个 `tool_calls`（`parallel_tool_calls=True`），通过受控分段（`_partition_batch_segments`）与 `asyncio.Semaphore(max_concurrency)` 仅并发执行无依赖只读工具（`weather`/`search`/`calculator`），同一会话的待办写操作（`add`/`complete`/`delete`）及同批相关读写（`todo.list`）保持严格串行并立即落盘；单项超时或错误独立记录结果，不中断同批其他调用。
     - 小阶段 6（完善恢复、Trace 与测试）：并行乱序完成的工具结果按请求顺序精准绑定各自的模型 `api_call_id` 与内部幂等 `call_id`，批量调用逐个计入 `max_steps` 预算；复用 M5 写操作即时落盘、跨尝试稳定的 `call_id` 幂等恢复与 `attempt_id` Trace 校验，补齐部分失败、中途取消（`CancelledError`）、重启恢复及真实 API 并发/串行验收测试。
+19. 修复同步工具直接运行阻塞异步循环及超时失效；原生调用的上下文预算同时计入消息与工具 Schema；实现仅从用户明确输入维护当前 session 的可更新、可删除记忆，并在相关提问前按需召回。遵循 task_list.md、PLAN.md，补齐回归与全量测试，更新说明并提交 Git commit。

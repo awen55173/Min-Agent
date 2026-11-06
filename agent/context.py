@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .llm import Message
+from .memory import strip_memory_declarations
 from .parser import ParseError, extract_json
 
 _OBS_RE = re.compile(r"^Observation \(tool=([^,]+), status=(ok|error|interrupted)\): (.*)$", re.S)
@@ -59,6 +60,13 @@ def estimate_messages_tokens(messages: list[Message]) -> int:
     return total
 
 
+def estimate_tool_schema_tokens(tools: list[dict[str, Any]] | None) -> int:
+    """估算原生工具定义的请求开销。"""
+    if not tools:
+        return 0
+    return estimate_tokens(json.dumps(tools, ensure_ascii=False, separators=(",", ":"))) + 4 * len(tools)
+
+
 def _clip_preserve_edges(text: str, max_chars: int) -> str:
     """截断文本时同时保留开头和结尾，避免末尾的金额、地点或偏好丢失。"""
     if max_chars <= 0:
@@ -92,9 +100,11 @@ def truncate_to_tokens(text: str, max_tokens: int) -> str:
     return best
 
 
-def check_context_budget(messages: list[Message], max_tokens: int) -> None:
-    """校验每次模型请求的硬预算，超限时明确拒绝发送。"""
-    used = estimate_messages_tokens(messages)
+def check_context_budget(
+    messages: list[Message], max_tokens: int, tools: list[dict[str, Any]] | None = None,
+) -> None:
+    """检查消息与原生工具定义的总预算，超限时拒绝发送。"""
+    used = estimate_messages_tokens(messages) + estimate_tool_schema_tokens(tools)
     if used > max_tokens:
         raise ContextBudgetError(f"上下文预算不足：估算 {used} tokens，上限 {max_tokens}；请缩短输入或分批处理。")
 
@@ -134,6 +144,12 @@ def _strip_assistant_thought(content: str) -> str:
 
 def sanitize_turn(turn: list[Message]) -> list[Message]:
     """清理单轮历史消息：移除格式错误重试噪音、剥离历史 thought，并保证原生 tool_calls 与 tool 结果成对。"""
+    if turn and _is_turn_start(turn[0]):
+        original = turn[0].get("content", "")
+        if original and not strip_memory_declarations(original) and all(
+            m.get("role") == "assistant" and not m.get("tool_calls") for m in turn[1:]
+        ):
+            return []
     out: list[Message] = []
     i = 0
     while i < len(turn):
@@ -168,7 +184,8 @@ def sanitize_turn(turn: list[Message]) -> list[Message]:
                 tool_msg["name"] = str(msg["name"])
             out.append(tool_msg)
         else:
-            out.append({"role": role, "content": content})
+            out.append({"role": role, "content": strip_memory_declarations(content)
+                        if role == "user" and _is_turn_start(msg) else content})
         i += 1
     return _ensure_tool_Pairs(out)
 
@@ -508,7 +525,7 @@ def summarize_turns(
                 if content.startswith("Format error: "):
                     continue
                 if not user_text:
-                    user_text = content.strip()
+                    user_text = strip_memory_declarations(content).strip()
                     _add_unique(summary.user_goals, user_text)
                     for fact in _extract_user_facts(user_text):
                         _add_unique(summary.key_facts, fact)
@@ -604,31 +621,48 @@ def build_context(
     max_context_tokens: int = DEFAULT_CONTEXT_TOKENS,
     reserved_tokens: int = DEFAULT_RESERVED_TOKENS,
     max_summary_tokens: int = DEFAULT_SUMMARY_TOKENS,
+    tools_schema: list[dict[str, Any]] | None = None,
+    recalled_memories: dict[str, str] | None = None,
+    memory_question: bool = False,
 ) -> ContextPlan:
-    """构建发送给模型的受限上下文：系统提示 +（可选）结构化摘要 + 最近对话原文（剥离 thought）+ 本轮输入。
-
-    按历史轮数上限和预留工具空间后的目标预算触发压缩，并保证最终消息不超过
-    max_context_tokens；不修改传入的 history 列表。
-    """
+    """按消息、用户记忆及工具定义预算构建受限上下文，不修改历史原文。"""
     turns = split_into_turns(history)
     sanitized_turns = [sanitize_turn(t) for t in turns]
     all_recent = [m for t in sanitized_turns for m in t]
 
     sys_msg: Message = {"role": "system", "content": system_prompt}
     user_msg: Message = {"role": "user", "content": user_input}
+    memory_msg: Message | None = None
+    if recalled_memories:
+        lines = ["当前会话中用户明确提供的相关信息（以此为准，勿从历史回答或工具结果补全）："]
+        for key, value in recalled_memories.items():
+            line = f"- {key}: {value}"
+            if estimate_tokens("\n".join([*lines, line])) > 800:
+                break
+            lines.append(line)
+        if len(lines) > 1:
+            memory_msg = {"role": "system", "content": "\n".join(lines)}
+    elif memory_question:
+        memory_msg = {"role": "system", "content": (
+            "当前会话没有已保存的相关用户记忆；不要从历史回答或工具结果推断个人信息。"
+        )}
+    fixed_msgs = [sys_msg, *([memory_msg] if memory_msg else []), user_msg]
     hard_budget = max_context_tokens
-    fixed_tokens = estimate_messages_tokens([sys_msg, user_msg])
-    check_context_budget([sys_msg, user_msg], hard_budget)
+    schema_tokens = estimate_tool_schema_tokens(tools_schema)
+    fixed_tokens = estimate_messages_tokens(fixed_msgs) + schema_tokens
+    check_context_budget(fixed_msgs, hard_budget, tools_schema)
     budget = max(hard_budget - max(reserved_tokens, 0), fixed_tokens)
 
     refreshed_existing = refresh_summary_todos(existing_summary, todos, max_summary_tokens) if existing_summary.strip() else ""
     base_msgs: list[Message] = [sys_msg]
+    if memory_msg:
+        base_msgs.append(memory_msg)
     if refreshed_existing:
         base_msgs.append({"role": "system", "content": refreshed_existing})
     base_msgs.extend(all_recent)
     base_msgs.append(user_msg)
 
-    need_compress = len(turns) > max_history_turns or estimate_messages_tokens(base_msgs) > budget
+    need_compress = len(turns) > max_history_turns or estimate_messages_tokens(base_msgs) + schema_tokens > budget
     if not need_compress:
         return ContextPlan(
             messages=base_msgs,
@@ -637,7 +671,7 @@ def build_context(
             compressed=bool(refreshed_existing),
             compressed_turn_count=0,
             kept_turn_count=len(turns),
-            estimated_tokens=estimate_messages_tokens(base_msgs),
+            estimated_tokens=estimate_messages_tokens(base_msgs) + schema_tokens,
         )
 
     keep_count = min(len(turns), max(max_history_turns, 0))
@@ -665,12 +699,13 @@ def build_context(
             raise
         candidate_msgs: list[Message] = [
             sys_msg,
+            *([memory_msg] if memory_msg else []),
             {"role": "system", "content": summary_text},
             *recent_messages,
             user_msg,
         ]
-        total_tokens = estimate_messages_tokens(candidate_msgs)
-        check_context_budget(candidate_msgs, hard_budget)
+        total_tokens = estimate_messages_tokens(candidate_msgs) + schema_tokens
+        check_context_budget(candidate_msgs, hard_budget, tools_schema)
         if total_tokens <= budget:
             return ContextPlan(
                 messages=candidate_msgs,

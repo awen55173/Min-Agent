@@ -5,6 +5,7 @@ import asyncio
 from dataclasses import dataclass
 import inspect
 import json
+import threading
 from typing import Any, Awaitable, Callable
 import uuid
 
@@ -43,6 +44,8 @@ class ToolResult:
 
     ok: bool
     content: str
+    timed_out: bool = False
+    execution_state: str = "completed"
 
 
 @dataclass
@@ -109,6 +112,7 @@ class ToolRegistry:
     def __init__(self) -> None:
         """初始化空注册表。"""
         self._tools: dict[str, Tool] = {}
+        self._write_lock = threading.Lock()
 
     def register(self, tool: Tool) -> Tool:
         """注册工具，重名则抛 ValueError。"""
@@ -167,7 +171,7 @@ class ToolRegistry:
         ctx: ToolContext | None = None,
         timeout: float | None = None,
     ) -> ToolResult:
-        """异步校验并执行工具：支持超时控制（TimeoutError 转为 ok=False），并保留 CancelledError 向上传播。"""
+        """在线程中运行同步工具；只读超时报告未确定状态，写操作等完成后报告结果。"""
         tool = self._tools.get(name)
         if tool is None:
             return ToolResult(False, f"unknown tool '{name}'. available: {', '.join(self._tools)}")
@@ -181,18 +185,48 @@ class ToolRegistry:
                     return await tool.afunc(args, eff_ctx)
                 if inspect.iscoroutinefunction(tool.func):
                     return await tool.func(args, eff_ctx)
-                res = tool.func(args, eff_ctx)
+                res = await asyncio.to_thread(tool.func, args, eff_ctx)
                 if inspect.isawaitable(res):
                     return await res
                 return res
 
-            coro = _invoke()
-            out = await (asyncio.wait_for(coro, timeout=timeout) if timeout is not None else coro)
-            return ToolResult(True, serialize_result(out))
+            if tool.read_only:
+                coro = _invoke()
+                out = await (asyncio.wait_for(coro, timeout=timeout) if timeout is not None else coro)
+                return ToolResult(True, serialize_result(out))
+
+            # 写操作只允许串行执行；超时后仍等待线程结束，避免未知副作用与后续写入竞态。
+            while not self._write_lock.acquire(blocking=False):
+                await asyncio.sleep(0.005)
+            try:
+                task = asyncio.create_task(_invoke())
+                try:
+                    out = await (asyncio.wait_for(asyncio.shield(task), timeout=timeout)
+                                 if timeout is not None else asyncio.shield(task))
+                    return ToolResult(True, serialize_result(out))
+                except asyncio.CancelledError:
+                    # 调用方取消后仍等写入结束，再释放串行锁并传递取消信号。
+                    try:
+                        await asyncio.shield(task)
+                    except Exception:
+                        pass
+                    raise
+                except asyncio.TimeoutError:
+                    try:
+                        out = await task
+                        return ToolResult(True, serialize_result(out), True, "completed_after_timeout")
+                    except ToolError as e:
+                        return ToolResult(False, str(e), True, "completed_after_timeout")
+                    except Exception as e:
+                        return ToolResult(False, f"tool '{name}' failed: {type(e).__name__}: {e}",
+                                          True, "completed_after_timeout")
+            finally:
+                self._write_lock.release()
         except asyncio.CancelledError:
             raise
         except asyncio.TimeoutError:
-            return ToolResult(False, f"tool '{name}' timed out after {timeout}s")
+            return ToolResult(False, f"tool '{name}' timed out after {timeout}s; "
+                              "the background execution may still be running", True, "unknown_after_timeout")
         except ToolError as e:
             return ToolResult(False, str(e))
         except Exception as e:

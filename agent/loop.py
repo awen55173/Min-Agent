@@ -184,9 +184,11 @@ class Agent:
         store = getattr(todo_tool, "store", None) if todo_tool is not None else None
         return store if isinstance(store, TodoStore) else None
 
-    def _call_llm_native(self, messages: list[Message]) -> LLMResponse:
+    def _call_llm_native(
+        self, messages: list[Message], tools_schema: list[dict[str, Any]] | None = None,
+    ) -> LLMResponse:
         """在原生工具模式下同步调用模型，传入注册表导出的 OpenAI tools Schema。"""
-        tools_schema = self._registry.openai_tools()
+        tools_schema = tools_schema if tools_schema is not None else self._registry.openai_tools()
         complete_fn = getattr(self._llm, "complete", None)
         if callable(complete_fn):
             return complete_fn(
@@ -197,9 +199,11 @@ class Agent:
         raw = self._llm.chat(messages)
         return normalize_llm_response(raw)
 
-    async def _acall_llm_native(self, messages: list[Message]) -> LLMResponse:
+    async def _acall_llm_native(
+        self, messages: list[Message], tools_schema: list[dict[str, Any]] | None = None,
+    ) -> LLMResponse:
         """在原生工具模式下异步调用模型，传入注册表导出的 OpenAI tools Schema。"""
-        tools_schema = self._registry.openai_tools()
+        tools_schema = tools_schema if tools_schema is not None else self._registry.openai_tools()
         acomplete_fn = getattr(self._llm, "acomplete", None)
         if callable(acomplete_fn):
             return await acomplete_fn(
@@ -1769,8 +1773,9 @@ class Agent:
             self._pending_record = None
             self._active_batch = None
             try:
-                check_context_budget(messages, self._max_context_tokens)
-                resp = self._call_llm_native(messages)
+                tools_schema = self._registry.openai_tools()
+                check_context_budget(messages, self._max_context_tokens, tools_schema)
+                resp = self._call_llm_native(messages, tools_schema)
             except ContextBudgetError as e:
                 return finish(
                     CONTEXT_LIMIT,
@@ -1937,8 +1942,9 @@ class Agent:
             self._pending_record = None
             self._active_batch = None
             try:
-                check_context_budget(messages, self._max_context_tokens)
-                resp = await self._acall_llm_native(messages)
+                tools_schema = self._registry.openai_tools()
+                check_context_budget(messages, self._max_context_tokens, tools_schema)
+                resp = await self._acall_llm_native(messages, tools_schema)
             except ContextBudgetError as e:
                 return await afinish(
                     CONTEXT_LIMIT,

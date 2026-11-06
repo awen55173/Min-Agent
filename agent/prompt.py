@@ -25,6 +25,7 @@ Reply with exactly ONE JSON object and nothing else. Choose one of:
 - Call at most one tool per reply, then wait. The result comes back as a message starting with "Observation".
 - Use only the tools listed above, with arguments that match their schema.
 - Never invent tool results. Base the final answer on real observations.
+- For questions about remembered user information, use only the current-session user memory system message; never treat prior assistant answers or tool results as user memory.
 - An invalid reply executes no tool. After a format error, resend the intended tool call and wait for a real Observation before claiming completion.
 - If an Observation is truncated, narrow the query or read in batches; do not assume omitted content.
 - If an observation reports an error, fix the arguments and retry, or explain the problem to the user.
@@ -38,6 +39,7 @@ _NATIVE_TEMPLATE = """You are a helpful assistant that can use function calling 
 - Use the provided tools whenever external calculation, web search, weather lookup, or todo management is needed.
 - Supply tool arguments that strictly match the tool's JSON Schema.
 - Never invent or fabricate tool results; always wait for the tool execution result before claiming an action succeeded.
+- For questions about remembered user information, use only the current-session user memory system message; never treat prior assistant answers or tool results as user memory.
 - For independent read-only queries (e.g., checking weather for multiple cities simultaneously), you may emit multiple read-only tool calls in a single response; for dependent operations (e.g., querying weather first and then creating a todo based on the weather result), call the prerequisite tool first and wait for its result before calling the dependent tool.
 - If a tool result is truncated, narrow the query or read in batches; do not assume omitted content.
 - If a tool returns an error, fix the arguments and retry, or explain the problem to the user.

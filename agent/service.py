@@ -15,6 +15,7 @@ from .context import (
     refresh_summary_todos,
 )
 from .llm import LLMClient, Message
+from .memory import apply_user_memory, select_memories, wants_memory_recall
 from .loop import CONTEXT_LIMIT, INTERRUPTED, OK, PERSIST_FAILED, Agent, AgentResult
 from .prompt import build_system_prompt
 from .session import SessionError, SessionManager
@@ -142,6 +143,7 @@ class ChatService:
             store = TodoStore()
             store.load_state(ctx, data.todos)
             registry = self._factory(store)
+            data.memories = apply_user_memory(data.memories, text)
             try:
                 ctx_plan = build_context(
                     system_prompt=build_system_prompt(registry, tool_mode=mode),
@@ -152,6 +154,9 @@ class ChatService:
                     max_history_turns=self._max_history_turns,
                     max_context_tokens=self._max_context_tokens,
                     reserved_tokens=self._reserved_tokens,
+                    tools_schema=registry.openai_tools() if mode == "native" else None,
+                    recalled_memories=select_memories(data.memories, text),
+                    memory_question=wants_memory_recall(text),
                 )
             except ContextBudgetError as e:
                 ans = f"{e}\n本轮尚未执行任何工具操作。\n未完成说明：输入或固定上下文超出预算限制，未调用模型。"
@@ -332,6 +337,7 @@ class ChatService:
             store = TodoStore()
             store.load_state(ctx, data.todos)
             registry = self._factory(store)
+            data.memories = apply_user_memory(data.memories, text)
             try:
                 ctx_plan = build_context(
                     system_prompt=build_system_prompt(registry, tool_mode=mode),
@@ -342,6 +348,9 @@ class ChatService:
                     max_history_turns=self._max_history_turns,
                     max_context_tokens=self._max_context_tokens,
                     reserved_tokens=self._reserved_tokens,
+                    tools_schema=registry.openai_tools() if mode == "native" else None,
+                    recalled_memories=select_memories(data.memories, text),
+                    memory_question=wants_memory_recall(text),
                 )
             except ContextBudgetError as e:
                 ans = f"{e}\n本轮尚未执行任何工具操作。\n未完成说明：输入或固定上下文超出预算限制，未调用模型。"

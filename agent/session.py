@@ -78,6 +78,7 @@ class SessionData:
     summary: str = ""
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
     unfinished_turn: dict[str, Any] | None = None
+    memories: dict[str, str] = field(default_factory=dict)
 
     def unfinished_calls(self) -> list[dict[str, Any]]:
         """返回会话中状态为 pending 或 interrupted 的未完成工具调用记录。"""
@@ -90,6 +91,7 @@ class SessionData:
             "next_turn": self.next_turn, "history": self.history, "todos": self.todos,
             "summary": self.summary, "tool_calls": self.tool_calls,
             "unfinished_turn": self.unfinished_turn,
+            "memories": self.memories,
             "created_at": self.created_at, "updated_at": self.updated_at,
         }
 
@@ -213,6 +215,12 @@ def validate_session_dict(raw: Any, user_id: str, session_id: str) -> SessionDat
     summary = raw.get("summary", "")
     if not isinstance(summary, str):
         raise SessionCorruptError("invalid 'summary'")
+    memories = raw.get("memories", {})
+    if not isinstance(memories, dict) or any(
+        not isinstance(key, str) or not key or not isinstance(value, str)
+        for key, value in memories.items()
+    ):
+        raise SessionCorruptError("invalid 'memories'")
     tool_calls = _validate_tool_calls(raw.get("tool_calls", []))
     unfinished_turn = _validate_unfinished_turn(raw.get("unfinished_turn", None))
     for key in ("created_at", "updated_at"):
@@ -222,7 +230,7 @@ def validate_session_dict(raw: Any, user_id: str, session_id: str) -> SessionDat
         user_id, session_id, raw["version"], raw["next_turn"],
         norm_history,
         todos, raw["created_at"], raw["updated_at"], summary,
-        tool_calls, unfinished_turn,
+        tool_calls, unfinished_turn, memories,
     )
 
 
