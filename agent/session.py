@@ -1,17 +1,18 @@
 """会话管理：以 (user_id, session_id) 标识会话，JSON 文件原子存储，文件锁 + 进程内锁 + 版本校验。"""
 from __future__ import annotations
 
+import asyncio
+from contextlib import asynccontextmanager, contextmanager
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 import json
 import os
+from pathlib import Path
 import re
 import threading
 import time
+from typing import Any, AsyncIterator, Iterator
 import uuid
-from contextlib import contextmanager
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, Iterator
 
 _ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _ROLES = {"user", "assistant", "tool"}  # 历史中不保存 system 提示词；支持原生 tool 角色与旧版 user/assistant
@@ -310,6 +311,28 @@ class _FileLock:
             self._thread.start()
             return
 
+    async def aacquire(self, deadline: float | None = None) -> None:
+        """异步获取文件锁并启动心跳；等待期间通过 asyncio.sleep 让出事件循环，避免阻塞其他会话。"""
+        deadline = deadline if deadline is not None else time.monotonic() + self._timeout
+        token = uuid.uuid4().hex
+        while True:
+            try:
+                fd = os.open(self._path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
+                if await asyncio.to_thread(self._try_reclaim):
+                    continue
+                if time.monotonic() >= deadline:
+                    raise SessionBusyError("session is in use by another window/process (lock timeout)") from None
+                await asyncio.sleep(self._poll)
+                continue
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump({"pid": os.getpid(), "token": token, "time": time.time()}, f)
+            self._token = token
+            self._stop.clear()
+            self._thread = threading.Thread(target=self._beat, name=f"lock-heartbeat:{self._path.name}", daemon=True)
+            self._thread.start()
+            return
+
     def owned(self) -> bool:
         """锁文件当前是否仍属于自己（未被回收或接管）。"""
         if self._token is None or self.lost:
@@ -372,6 +395,10 @@ class Session:
     def save(self) -> None:
         """保存会话：须仍持有锁且磁盘版本等于加载版本，否则抛错；成功后版本号加一。"""
         self._manager._save(self)
+
+    async def asave(self) -> None:
+        """异步保存会话：在工作线程执行刷盘与原子替换，避免阻塞事件循环中的其他并发会话。"""
+        await asyncio.to_thread(self.save)
 
 
 class SessionManager:
@@ -451,6 +478,32 @@ class SessionManager:
                 yield Session(self, data, flock)
             finally:
                 flock.release()
+        finally:
+            tlock.release()
+
+    @asynccontextmanager
+    async def aopen(self, user_id: str, session_id: str, create: bool = False) -> AsyncIterator[Session]:
+        """异步加锁打开会话：进程内锁与文件锁等待均让出事件循环，不阻塞其他会话的并发读写。"""
+        path = self._path(user_id, session_id)
+        deadline = time.monotonic() + self._lock_timeout
+        tlock = self._thread_lock((user_id, session_id))
+        while not tlock.acquire(blocking=False):
+            if time.monotonic() >= deadline:
+                raise SessionBusyError("session is in use by another window (lock timeout)")
+            await asyncio.sleep(0.01)
+        flock = _FileLock(path.with_name(path.name + ".lock"), self._lock_timeout, self._stale_after)
+        try:
+            await asyncio.to_thread(path.parent.mkdir, parents=True, exist_ok=True)
+            await flock.aacquire(deadline)
+            try:
+                data = await asyncio.to_thread(self._load, path, user_id, session_id)
+                if data is None:
+                    if not create:
+                        raise SessionNotFoundError(f"session '{session_id}' of user '{user_id}' does not exist")
+                    data = SessionData(user_id, session_id)
+                yield Session(self, data, flock)
+            finally:
+                await asyncio.to_thread(flock.release)
         finally:
             tlock.release()
 

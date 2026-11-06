@@ -145,6 +145,7 @@ def make_todo_tool(store: TodoStore) -> Tool:
             "required": ["action"],
         },
         func=run,
+        read_only=False,
     )
     tool.store = store  # type: ignore[attr-defined]
     return tool

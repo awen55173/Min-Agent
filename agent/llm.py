@@ -1,12 +1,14 @@
-"""封装兼容 OpenAI 的模型调用（支持原生 tools 函数调用与纯文本补全），并提供测试用模拟客户端。"""
+"""封装兼容 OpenAI 的同步与异步模型调用（支持原生 tools 函数调用与纯文本补全），并提供测试用模拟客户端。"""
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
+import inspect
 import json
 import time
 from typing import Any, Protocol
 
-from openai import APIConnectionError, APIStatusError, APITimeoutError, OpenAI, RateLimitError
+from openai import APIConnectionError, APIStatusError, APITimeoutError, AsyncOpenAI, OpenAI, RateLimitError
 
 from .config import Settings
 
@@ -85,18 +87,25 @@ class LLMClient(Protocol):
 
 
 class OpenAIClient:
-    """调用兼容 OpenAI 的接口，支持自定义服务地址与原生函数工具调用。"""
+    """调用兼容 OpenAI 的同步与异步接口，支持自定义服务地址与原生函数工具调用。"""
 
     supports_native_tools: bool = True
 
     def __init__(self, settings: Settings, temperature: float = 0.1, backoff: float = 1.0):
-        """按配置创建客户端，并保存模型参数和重试策略。"""
+        """按配置创建同步与异步客户端，并保存模型参数、超时和重试策略。"""
         self._model = settings.model
         self._temperature = temperature
+        self._timeout = settings.timeout
         self._max_retries = settings.max_retries
         self._backoff = backoff
         # 关闭 SDK 自动重试，由当前客户端统一控制。
         self._client = OpenAI(
+            api_key=settings.api_key,
+            base_url=settings.base_url,
+            timeout=settings.timeout,
+            max_retries=0,
+        )
+        self._async_client = AsyncOpenAI(
             api_key=settings.api_key,
             base_url=settings.base_url,
             timeout=settings.timeout,
@@ -141,7 +150,7 @@ class OpenAIClient:
         tools: list[dict[str, Any]] | None = None,
         parallel_tool_calls: bool | None = None,
     ) -> LLMResponse:
-        """发送消息（可选附带原生 tools Schema）并返回统一的 LLMResponse，带指数退避重试。"""
+        """同步发送消息（可选附带原生 tools Schema）并返回统一的 LLMResponse，带指数退避重试。"""
         last_err: Exception | None = None
         use_parallel_param = parallel_tool_calls is not None
         for attempt in range(self._max_retries + 1):
@@ -171,8 +180,49 @@ class OpenAIClient:
                 time.sleep(self._backoff * (2**attempt))
         raise LLMError(f"LLM unavailable after {self._max_retries + 1} attempts: {last_err}") from last_err
 
+    async def acomplete(
+        self,
+        messages: list[Message],
+        tools: list[dict[str, Any]] | None = None,
+        parallel_tool_calls: bool | None = None,
+        timeout: float | None = None,
+    ) -> LLMResponse:
+        """异步发送消息并返回统一的 LLMResponse；统一处理超时、取消传播与指数退避重试。"""
+        last_err: Exception | None = None
+        use_parallel_param = parallel_tool_calls is not None
+        eff_timeout = timeout if timeout is not None else self._timeout
+        for attempt in range(self._max_retries + 1):
+            try:
+                kwargs: dict[str, Any] = {
+                    "model": self._model,
+                    "messages": messages,
+                    "temperature": self._temperature,
+                }
+                if tools:
+                    kwargs["tools"] = tools
+                    kwargs["tool_choice"] = "auto"
+                    if use_parallel_param and parallel_tool_calls is not None:
+                        kwargs["parallel_tool_calls"] = parallel_tool_calls
+                coro = self._async_client.chat.completions.create(**kwargs)
+                resp = await (asyncio.wait_for(coro, timeout=eff_timeout) if eff_timeout else coro)
+                return self._extract_response(resp)
+            except asyncio.CancelledError:
+                raise
+            except (APIConnectionError, APITimeoutError, RateLimitError, asyncio.TimeoutError) as e:
+                last_err = e
+            except APIStatusError as e:
+                if e.status_code == 400 and use_parallel_param and "parallel_tool_calls" in str(e.message):
+                    use_parallel_param = False
+                    continue
+                if e.status_code < 500:
+                    raise LLMError(f"LLM request rejected ({e.status_code}): {e.message}") from e
+                last_err = e
+            if attempt < self._max_retries:
+                await asyncio.sleep(self._backoff * (2**attempt))
+        raise LLMError(f"LLM unavailable after {self._max_retries + 1} attempts: {last_err}") from last_err
+
     def chat(self, messages: list[Message]) -> str:
-        """发送消息并返回文本，对连接、超时、限流和服务端错误退避重试。"""
+        """同步发送消息并返回文本，对连接、超时、限流和服务端错误退避重试。"""
         last_err: Exception | None = None
         for attempt in range(self._max_retries + 1):
             try:
@@ -190,9 +240,32 @@ class OpenAIClient:
                 time.sleep(self._backoff * (2**attempt))
         raise LLMError(f"LLM unavailable after {self._max_retries + 1} attempts: {last_err}") from last_err
 
+    async def achat(self, messages: list[Message], timeout: float | None = None) -> str:
+        """异步发送消息并返回纯文本；统一处理超时、取消传播与指数退避重试。"""
+        last_err: Exception | None = None
+        eff_timeout = timeout if timeout is not None else self._timeout
+        for attempt in range(self._max_retries + 1):
+            try:
+                coro = self._async_client.chat.completions.create(
+                    model=self._model, messages=messages, temperature=self._temperature
+                )
+                resp = await (asyncio.wait_for(coro, timeout=eff_timeout) if eff_timeout else coro)
+                return self._extract(resp)
+            except asyncio.CancelledError:
+                raise
+            except (APIConnectionError, APITimeoutError, RateLimitError, asyncio.TimeoutError) as e:
+                last_err = e
+            except APIStatusError as e:
+                if e.status_code < 500:
+                    raise LLMError(f"LLM request rejected ({e.status_code}): {e.message}") from e
+                last_err = e
+            if attempt < self._max_retries:
+                await asyncio.sleep(self._backoff * (2**attempt))
+        raise LLMError(f"LLM unavailable after {self._max_retries + 1} attempts: {last_err}") from last_err
+
 
 class FakeLLM:
-    """按顺序返回预设回复（支持纯文本或带 tool_calls 的 LLMResponse/字典），并记录收到的消息。"""
+    """按顺序返回预设回复（支持同步与异步、纯文本或带 tool_calls 的 LLMResponse/字典），并记录收到的消息。"""
 
     def __init__(self, replies: list[Any], native: bool | None = None):
         """复制预设回复，并初始化调用记录；native=True 或回复含结构化响应时启用原生工具模式。"""
@@ -210,7 +283,7 @@ class FakeLLM:
         tools: list[dict[str, Any]] | None = None,
         parallel_tool_calls: bool | None = None,
     ) -> LLMResponse:
-        """记录消息与工具定义，并返回归一化后的下一条预设 LLMResponse。"""
+        """同步记录消息与工具定义，并返回归一化后的下一条预设 LLMResponse。"""
         self.calls.append([dict(m) for m in messages])
         self.tools_passed.append(tools)
         if not self._replies:
@@ -222,8 +295,32 @@ class FakeLLM:
             item = item(messages)
         return normalize_llm_response(item)
 
+    async def acomplete(
+        self,
+        messages: list[Message],
+        tools: list[dict[str, Any]] | None = None,
+        parallel_tool_calls: bool | None = None,
+        timeout: float | None = None,
+    ) -> LLMResponse:
+        """异步记录消息与工具定义，并返回归一化后的下一条预设 LLMResponse（支持协程回调与超时控制）。"""
+        self.calls.append([dict(m) for m in messages])
+        self.tools_passed.append(tools)
+        if not self._replies:
+            raise LLMError("FakeLLM has no more scripted replies")
+        item = self._replies.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        if callable(item):
+            item = item(messages)
+        if inspect.isawaitable(item):
+            try:
+                item = await (asyncio.wait_for(item, timeout=timeout) if timeout else item)
+            except asyncio.TimeoutError as e:
+                raise LLMError(f"FakeLLM timed out after {timeout}s") from e
+        return normalize_llm_response(item)
+
     def chat(self, messages: list[Message]) -> str:
-        """记录消息并返回下一条预设回复文本，回复耗尽时抛出异常。"""
+        """同步记录消息并返回下一条预设回复文本，回复耗尽时抛出异常。"""
         self.calls.append([dict(m) for m in messages])
         if not self._replies:
             raise LLMError("FakeLLM has no more scripted replies")
@@ -232,6 +329,25 @@ class FakeLLM:
             raise item
         if callable(item):
             item = item(messages)
+        if isinstance(item, LLMResponse):
+            return item.content
+        return str(item)
+
+    async def achat(self, messages: list[Message], timeout: float | None = None) -> str:
+        """异步记录消息并返回下一条预设回复文本（支持协程回调与超时控制）。"""
+        self.calls.append([dict(m) for m in messages])
+        if not self._replies:
+            raise LLMError("FakeLLM has no more scripted replies")
+        item = self._replies.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        if callable(item):
+            item = item(messages)
+        if inspect.isawaitable(item):
+            try:
+                item = await (asyncio.wait_for(item, timeout=timeout) if timeout else item)
+            except asyncio.TimeoutError as e:
+                raise LLMError(f"FakeLLM timed out after {timeout}s") from e
         if isinstance(item, LLMResponse):
             return item.content
         return str(item)

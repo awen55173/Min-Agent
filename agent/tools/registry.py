@@ -1,10 +1,12 @@
-"""工具接口与注册表：名称、描述、参数 Schema，并在执行前校验参数。"""
+"""工具接口与注册表：名称、描述、参数 Schema，支持同步与异步（含超时与取消）执行。"""
 from __future__ import annotations
 
-import json
-import uuid
+import asyncio
 from dataclasses import dataclass
-from typing import Any, Callable
+import inspect
+import json
+from typing import Any, Awaitable, Callable
+import uuid
 
 TurnId = str | int  # 对话轮次标识；同一会话内必须唯一
 
@@ -45,12 +47,14 @@ class ToolResult:
 
 @dataclass
 class Tool:
-    """工具定义：名称、描述、参数 JSON Schema 与执行函数。"""
+    """工具定义：名称、描述、参数 JSON Schema、同步执行函数与可选异步执行函数。"""
 
     name: str
     description: str
     parameters: dict[str, Any]  # JSON Schema (type=object)
     func: Callable[[dict[str, Any], ToolContext], Any]
+    afunc: Callable[[dict[str, Any], ToolContext], Awaitable[Any]] | None = None
+    read_only: bool = True
 
     def schema(self) -> dict[str, Any]:
         """返回注入 prompt 的工具描述。"""
@@ -100,7 +104,7 @@ def serialize_result(out: Any) -> str:
 
 
 class ToolRegistry:
-    """工具注册表：负责注册、查询、生成 schema 和统一执行。"""
+    """工具注册表：负责注册、查询、生成 schema 以及同步/异步统一执行。"""
 
     def __init__(self) -> None:
         """初始化空注册表。"""
@@ -113,12 +117,13 @@ class ToolRegistry:
         self._tools[tool.name] = tool
         return tool
 
-    def tool(self, name: str, description: str, parameters: dict[str, Any]):
-        """装饰器形式注册工具。"""
+    def tool(self, name: str, description: str, parameters: dict[str, Any], *, read_only: bool = True):
+        """装饰器形式注册同步或异步工具。"""
 
         def deco(func):
             """把被装饰函数注册为工具并原样返回。"""
-            self.register(Tool(name, description, parameters, func))
+            afn = func if inspect.iscoroutinefunction(func) else None
+            self.register(Tool(name, description, parameters, func, afunc=afn, read_only=read_only))
             return func
 
         return deco
@@ -140,14 +145,55 @@ class ToolRegistry:
         return [t.openai_schema() for t in self._tools.values()]
 
     def execute(self, name: str, args: Any, ctx: ToolContext | None = None) -> ToolResult:
-        """校验并执行工具；校验、执行、结果序列化的任何失败都转为 ok=False，不向外抛异常。"""
+        """同步校验并执行工具；校验、执行、结果序列化的任何失败都转为 ok=False，不向外抛异常。"""
         tool = self._tools.get(name)
         if tool is None:
             return ToolResult(False, f"unknown tool '{name}'. available: {', '.join(self._tools)}")
         try:
             validate_args(tool.parameters, args)
-            return ToolResult(True, serialize_result(tool.func(args, ctx or ToolContext())))
+            out = tool.func(args, ctx or ToolContext())
+            if inspect.isawaitable(out):
+                out = asyncio.run(out)
+            return ToolResult(True, serialize_result(out))
         except ToolError as e:
             return ToolResult(False, str(e))
         except Exception as e:  # 工具内部未预期异常
+            return ToolResult(False, f"tool '{name}' failed: {type(e).__name__}: {e}")
+
+    async def aexecute(
+        self,
+        name: str,
+        args: Any,
+        ctx: ToolContext | None = None,
+        timeout: float | None = None,
+    ) -> ToolResult:
+        """异步校验并执行工具：支持超时控制（TimeoutError 转为 ok=False），并保留 CancelledError 向上传播。"""
+        tool = self._tools.get(name)
+        if tool is None:
+            return ToolResult(False, f"unknown tool '{name}'. available: {', '.join(self._tools)}")
+        try:
+            validate_args(tool.parameters, args)
+            eff_ctx = ctx or ToolContext()
+
+            async def _invoke() -> Any:
+                """统一封装异步函数、协程返回值与普通同步函数的调用。"""
+                if tool.afunc is not None:
+                    return await tool.afunc(args, eff_ctx)
+                if inspect.iscoroutinefunction(tool.func):
+                    return await tool.func(args, eff_ctx)
+                res = tool.func(args, eff_ctx)
+                if inspect.isawaitable(res):
+                    return await res
+                return res
+
+            coro = _invoke()
+            out = await (asyncio.wait_for(coro, timeout=timeout) if timeout is not None else coro)
+            return ToolResult(True, serialize_result(out))
+        except asyncio.CancelledError:
+            raise
+        except asyncio.TimeoutError:
+            return ToolResult(False, f"tool '{name}' timed out after {timeout}s")
+        except ToolError as e:
+            return ToolResult(False, str(e))
+        except Exception as e:
             return ToolResult(False, f"tool '{name}' failed: {type(e).__name__}: {e}")

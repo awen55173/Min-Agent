@@ -2,18 +2,22 @@
 from __future__ import annotations
 
 from pathlib import Path
+import asyncio
 import json
+import time
 import types
 import pytest
 
 from agent.config import ConfigError, Settings
 from agent.context import build_context
 from agent.llm import FakeLLM, LLMError, LLMResponse, OpenAIClient, ToolCallItem, normalize_llm_response
-from agent.loop import MAX_STEPS, OK, PARSE_EXHAUSTED, TOOL_NOT_EXECUTED, Agent
+from agent.loop import INTERRUPTED, MAX_STEPS, OK, PARSE_EXHAUSTED, TOOL_NOT_EXECUTED, Agent
 from agent.prompt import build_native_system_prompt, build_system_prompt
 from agent.service import ChatService
 from agent.session import SessionCorruptError, SessionManager
 from agent.tools import TodoStore, build_registry
+from agent.tools.search import make_search_tool
+from agent.tools.weather import make_weather_tool
 import cli
 
 
@@ -426,3 +430,178 @@ def test_legacy_session_seamlessly_resumes_in_native_mode(tmp_path: Path):
     with mgr.open("u1", "legacy_s") as s:
         assert s.data.todos["items"][0]["done"] is True
         assert any(m.get("role") == "tool" for m in s.data.history)
+
+
+# ---------------------------------------------------------------------------
+# 阶段 4：改造异步执行链（异步 LLM、搜索/天气、Agent.arun、超时/取消/重试、非阻塞会话锁与 asend）
+# ---------------------------------------------------------------------------
+
+
+def test_async_llm_timeout_retry_and_cancellation(monkeypatch: pytest.MonkeyPatch):
+    """验证 OpenAIClient.acomplete 的异步重试、超时转换（LLMError）以及 CancelledError 直接向上传播。"""
+
+    async def _run():
+        """执行异步 LLM 重试、超时与取消测试。"""
+        settings = Settings(
+            api_key="sk-test",
+            model="test-model",
+            base_url="https://example.com/v1",
+            timeout=0.05,
+            max_retries=1,
+        )
+        client = OpenAIClient(settings, backoff=0.01)
+        calls = 0
+
+        async def flaky_create(**kwargs):
+            """第一次抛超时错误，第二次返回正常结果。"""
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise asyncio.TimeoutError("temporary timeout")
+            return types.SimpleNamespace(
+                choices=[types.SimpleNamespace(message=types.SimpleNamespace(content="重试成功", tool_calls=None))]
+            )
+
+        monkeypatch.setattr(client._async_client.chat.completions, "create", flaky_create)
+        resp = await client.acomplete([{"role": "user", "content": "hi"}])
+        assert resp.content == "重试成功"
+        assert calls == 2
+
+        # 超时应重试后转为 LLMError
+        async def slow_create(**kwargs):
+            """模拟超时请求。"""
+            await asyncio.sleep(0.3)
+
+        monkeypatch.setattr(client._async_client.chat.completions, "create", slow_create)
+        with pytest.raises(LLMError, match="LLM unavailable after 2 attempts"):
+            await client.acomplete([{"role": "user", "content": "hi"}])
+
+        # CancelledError 必须直接传播，不得被吞掉或重试
+        cancel_calls = 0
+
+        async def cancel_create(**kwargs):
+            """模拟被取消的请求。"""
+            nonlocal cancel_calls
+            cancel_calls += 1
+            raise asyncio.CancelledError()
+
+        monkeypatch.setattr(client._async_client.chat.completions, "create", cancel_create)
+        with pytest.raises(asyncio.CancelledError):
+            await client.acomplete([{"role": "user", "content": "hi"}])
+        assert cancel_calls == 1
+
+    asyncio.run(_run())
+
+
+def test_async_search_weather_and_agent_arun_with_tool_timeout():
+    """验证 search/weather 异步执行链、Agent.arun 主循环及工具超时（tool_timeout）处理。"""
+
+    async def _run():
+        """执行异步工具调用与超时测试。"""
+        async def fake_apost(url: str, payload: dict, api_key: str) -> dict:
+            """模拟异步 Tavily 搜索响应。"""
+            await asyncio.sleep(0.01)
+            return {
+                "answer": "Python 3.12 released",
+                "results": [{"title": "Py", "url": "https://python.org", "content": "Details"}],
+            }
+
+        async def fake_aget(url: str) -> dict:
+            """模拟异步天气响应（SlowCity 故意慢以触发超时）。"""
+            if "SlowCity" in url:
+                await asyncio.sleep(0.25)
+            else:
+                await asyncio.sleep(0.01)
+            return {
+                "current_condition": [
+                    {"temp_C": "22", "FeelsLikeC": "21", "humidity": "50", "weatherDesc": [{"value": "Clear"}]}
+                ]
+            }
+
+        reg = build_registry(tavily_api_key="tvly-test", http_post=fake_apost, http_get=fake_aget)
+
+        fake_llm = FakeLLM([
+            {"content": "", "tool_calls": [{"id": "tc_s1", "name": "search", "args": {"query": "python"}}]},
+            {"content": "", "tool_calls": [{"id": "tc_w1", "name": "weather", "args": {"city": "Beijing"}}]},
+            {"content": "", "tool_calls": [{"id": "tc_w2", "name": "weather", "args": {"city": "SlowCity"}}]},
+            "搜索与北京天气成功，SlowCity 查询超时。",
+        ])
+        agent = Agent(fake_llm, reg, tool_mode="native", tool_timeout=0.06)
+        res = await agent.arun("测试异步工具链")
+        assert res.status == OK
+        assert len(res.actions) == 3
+        assert res.actions[0].tool == "search" and res.actions[0].ok is True
+        assert res.actions[1].tool == "weather" and res.actions[1].ok is True
+        assert res.actions[2].tool == "weather" and res.actions[2].ok is False
+        assert "timed out" in str(res.actions[2].result)
+
+    asyncio.run(_run())
+
+
+def test_async_session_lock_and_asend_do_not_block_other_sessions(tmp_path: Path):
+    """验证异步会话锁与 ChatService.asend：慢会话持锁或等待锁时，不会阻塞其他会话并发完成。"""
+
+    async def _run():
+        """并发运行慢会话 s_slow 与快会话 s_fast，并测试异步等待同一会话锁时不阻塞事件循环。"""
+        mgr = SessionManager(tmp_path / "sessions", lock_timeout=2.0)
+
+        async def slow_aget(url: str) -> dict:
+            """对 SlowCity 延迟 0.2s，其余立即返回。"""
+            if "SlowCity" in url:
+                await asyncio.sleep(0.20)
+            return {
+                "current_condition": [
+                    {"temp_C": "20", "FeelsLikeC": "20", "humidity": "40", "weatherDesc": [{"value": "Sunny"}]}
+                ]
+            }
+
+        def make_reg(store: TodoStore):
+            """构建包含异步 weather 工具的注册表。"""
+            return build_registry(todo_store=store, http_get=slow_aget)
+
+        # s_slow 调用耗时 0.2s 的工具，s_fast 直接完成待办添加
+        llm_slow = FakeLLM([
+            {"content": "", "tool_calls": [{"id": "c_slow", "name": "weather", "args": {"city": "SlowCity"}}]},
+            "慢会话完成",
+            "慢会话第二次完成",
+        ])
+        llm_fast = FakeLLM([
+            {"content": "", "tool_calls": [{"id": "c_fast", "name": "todo", "args": {"action": "add", "text": "快会话待办"}}]},
+            "快会话完成",
+            "快会话第二次完成",
+        ])
+        svc_slow = ChatService(llm_slow, mgr, make_reg)
+        svc_fast = ChatService(llm_fast, mgr, make_reg)
+
+        t0 = time.monotonic()
+        task_slow = asyncio.create_task(svc_slow.asend("u1", "s_slow", "查慢城市", create=True))
+        await asyncio.sleep(0.02)  # 确保 s_slow 已持锁进入工具调用
+        res_fast = await svc_fast.asend("u1", "s_fast", "记快待办", create=True)
+        fast_elapsed = time.monotonic() - t0
+        res_slow = await task_slow
+
+        assert res_fast.status == OK
+        assert res_slow.status == OK
+        assert fast_elapsed < 0.15  # s_fast 未被 0.20s 的 s_slow 阻塞
+
+        # 进一步验证：当同一会话 s_slow 被锁住 0.12s 时，等待 s_slow 的协程通过 asyncio.sleep 轮询，不阻塞无关协程
+        async def hold_session_briefly():
+            """持锁 0.12s 后释放。"""
+            async with mgr.aopen("u1", "s_slow"):
+                await asyncio.sleep(0.12)
+
+        holder = asyncio.create_task(hold_session_briefly())
+        await asyncio.sleep(0.02)
+
+        waiter = asyncio.create_task(svc_slow.asend("u1", "s_slow", "第二次请求"))
+        t1 = time.monotonic()
+        res_other = await svc_fast.asend("u1", "s_fast", "再记一条")
+        other_elapsed = time.monotonic() - t1
+        assert res_other.status == OK
+        assert other_elapsed < 0.08  # 即使 waiter 正在等待 s_slow 的锁，s_fast 仍立即完成
+        await holder
+        res_waiter = await waiter
+        assert res_waiter.status == OK
+
+    asyncio.run(_run())
+

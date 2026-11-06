@@ -68,6 +68,7 @@ class ChatService:
         reserved_tokens: int = DEFAULT_RESERVED_TOKENS,
         trace_logger: TraceLogger | None = None,
         tool_mode: str = "native",
+        tool_timeout: float | None = None,
     ):
         """保存依赖及循环/上下文预算参数。"""
         if tool_mode not in ("native", "text"):
@@ -82,6 +83,7 @@ class ChatService:
         self._reserved_tokens = reserved_tokens
         self._trace_logger = trace_logger or TraceLogger(self._manager._root / "traces")
         self._tool_mode = tool_mode
+        self._tool_timeout = tool_timeout
 
     def _effective_tool_mode(self) -> str:
         """确定当前会话请求的实际工具模式：显式 text 或客户端不支持原生工具时走 text。"""
@@ -249,6 +251,7 @@ class ChatService:
                 max_context_tokens=self._max_context_tokens,
                 trace_logger=self._trace_logger,
                 tool_mode=self._tool_mode,
+                tool_timeout=self._tool_timeout,
             )
             try:
                 result = agent.run(
@@ -282,6 +285,194 @@ class ChatService:
                 }
                 try:
                     session.save()
+                except (OSError, SessionError):
+                    pass
+                raise
+
+            return result
+
+    async def asend(
+        self,
+        user_id: str,
+        session_id: str,
+        text: str,
+        create: bool = False,
+        retry: bool | None = None,
+    ) -> AgentResult:
+        """异步在会话内处理一轮输入并保存，使用非阻塞会话锁与异步保存避免阻塞其他并发会话。"""
+        async with self._manager.aopen(user_id, session_id, create=create) as session:
+            data = session.data
+            mode = self._effective_tool_mode()
+            if data.history:
+                data.history = _ensure_tool_Pairs(data.history)
+                if data.history[-1].get("role") in ("user", "tool"):
+                    data.history.append(_assistant_final(INTERRUPTED_NOTE, mode=mode))
+
+            if _is_retry_request(data.unfinished_turn, text, retry=retry):
+                assert data.unfinished_turn is not None
+                turn_id = data.unfinished_turn["turn_id"]
+                prev_attempt = data.unfinished_turn.get("attempt", 1)
+                next_from_state = (prev_attempt + 1) if isinstance(prev_attempt, int) else 2
+                attempt_id = max(next_from_state, self._trace_logger.next_attempt_id(user_id, session_id, turn_id))
+                tracked_prompt = str(data.unfinished_turn.get("prompt") or text)
+            else:
+                turn_id = session.next_turn_id()
+                attempt_id = self._trace_logger.next_attempt_id(user_id, session_id, turn_id)
+                tracked_prompt = text
+
+            ctx = ToolContext(user_id, session_id, turn_id)
+            store = TodoStore()
+            store.load_state(ctx, data.todos)
+            registry = self._factory(store)
+            try:
+                ctx_plan = build_context(
+                    system_prompt=build_system_prompt(registry, tool_mode=mode),
+                    history=data.history,
+                    user_input=text,
+                    existing_summary=data.summary,
+                    todos=data.todos,
+                    max_history_turns=self._max_history_turns,
+                    max_context_tokens=self._max_context_tokens,
+                    reserved_tokens=self._reserved_tokens,
+                )
+            except ContextBudgetError as e:
+                ans = f"{e}\n本轮尚未执行任何工具操作。\n未完成说明：输入或固定上下文超出预算限制，未调用模型。"
+                ev_start = self._trace_logger.log_turn_start(
+                    user_id, session_id, turn_id, text, attempt_id=attempt_id,
+                )
+                prev_history = list(data.history)
+                prev_unfinished = copy.deepcopy(data.unfinished_turn)
+                messages = [{"role": "user", "content": text}, _assistant_final(ans, mode=mode)]
+                data.history += messages
+                data.unfinished_turn = {
+                    "turn_id": turn_id,
+                    "attempt": attempt_id,
+                    "prompt": tracked_prompt,
+                    "status": CONTEXT_LIMIT,
+                }
+                final_status = CONTEXT_LIMIT
+                try:
+                    await session.asave()
+                except (OSError, SessionError) as save_err:
+                    data.history = prev_history
+                    data.unfinished_turn = prev_unfinished
+                    final_status = PERSIST_FAILED
+                    ans = f"保存写操作失败：{save_err}\n本轮尚未执行任何工具操作。\n未完成说明：{e}；且会话状态未能落盘。"
+                ev_end = self._trace_logger.log_turn_end(
+                    user_id, session_id, turn_id, final_status, ans, 0, 0.0,
+                    error=ans, attempt_id=attempt_id,
+                )
+                return AgentResult(
+                    final_status, ans, messages=messages, turn_id=turn_id,
+                    trace_events=[ev_start, ev_end], attempt_id=attempt_id,
+                )
+
+            data.summary = ctx_plan.summary
+            base_history = list(data.history)
+            prefix_len = len(ctx_plan.messages) - 1
+            data.unfinished_turn = {
+                "turn_id": turn_id,
+                "attempt": attempt_id,
+                "prompt": tracked_prompt,
+                "status": "in_progress",
+            }
+
+            async def on_step_change(cur_messages: list[Message], rec: dict, persist_now: bool) -> None:
+                """异步在工具状态变更时同步会话数据；待办写操作成功后立即异步原子保存。"""
+                prev_history = list(data.history)
+                prev_todos = copy.deepcopy(data.todos)
+                prev_summary = data.summary
+                prev_unfinished = copy.deepcopy(data.unfinished_turn)
+                data.todos = store.export_state(ctx)
+                data.history = base_history + cur_messages[prefix_len:]
+                data.summary = refresh_summary_todos(data.summary, data.todos)
+                data.unfinished_turn = {
+                    "turn_id": turn_id,
+                    "attempt": attempt_id,
+                    "prompt": tracked_prompt,
+                    "status": "in_progress",
+                }
+                if persist_now:
+                    try:
+                        await session.asave()
+                    except (OSError, SessionError):
+                        data.history = prev_history
+                        data.todos = prev_todos
+                        data.summary = prev_summary
+                        data.unfinished_turn = prev_unfinished
+                        raise
+
+            async def on_turn_end(status: str, answer: str, cur_messages: list[Message]) -> None:
+                """异步在记录 turn_end 日志前执行最终会话落盘；失败时恢复内存状态并向上抛出。"""
+                prev_history = list(data.history)
+                prev_todos = copy.deepcopy(data.todos)
+                prev_summary = data.summary
+                prev_unfinished = copy.deepcopy(data.unfinished_turn)
+                new_messages = list(cur_messages[prefix_len:])
+                if status != OK:
+                    new_messages.append(_assistant_final(answer, mode=mode))
+                    data.unfinished_turn = {
+                        "turn_id": turn_id,
+                        "attempt": attempt_id,
+                        "prompt": tracked_prompt,
+                        "status": status,
+                    }
+                else:
+                    data.unfinished_turn = None
+                data.history = base_history + new_messages
+                data.todos = store.export_state(ctx)
+                data.summary = refresh_summary_todos(data.summary, data.todos)
+                try:
+                    await session.asave()
+                except (OSError, SessionError):
+                    data.history = prev_history
+                    data.todos = prev_todos
+                    data.summary = prev_summary
+                    data.unfinished_turn = prev_unfinished
+                    raise
+
+            agent = Agent(
+                self._llm,
+                registry,
+                self._max_steps,
+                self._max_parse_retries,
+                max_context_tokens=self._max_context_tokens,
+                trace_logger=self._trace_logger,
+                tool_mode=self._tool_mode,
+                tool_timeout=self._tool_timeout,
+            )
+            try:
+                result = await agent.arun(
+                    text,
+                    user_id,
+                    session_id,
+                    turn_id,
+                    context_messages=ctx_plan.messages,
+                    call_records=data.tool_calls,
+                    todo_store=store,
+                    on_step_change=on_step_change,
+                    on_turn_end=on_turn_end,
+                    trace_logger=self._trace_logger,
+                    attempt_id=attempt_id,
+                )
+            except BaseException as e:
+                partial: AgentResult | None = getattr(e, "agent_result", None)
+                if partial is not None:
+                    new_messages = partial.messages[prefix_len:]
+                else:
+                    new_messages = [{"role": "user", "content": text}]
+                new_messages.append(_assistant_final(INTERRUPTED_NOTE, mode=mode))
+                data.history = base_history + new_messages
+                data.todos = store.export_state(ctx)
+                data.summary = refresh_summary_todos(data.summary, data.todos)
+                data.unfinished_turn = {
+                    "turn_id": turn_id,
+                    "attempt": attempt_id,
+                    "prompt": tracked_prompt,
+                    "status": INTERRUPTED,
+                }
+                try:
+                    await session.asave()
                 except (OSError, SessionError):
                     pass
                 raise
