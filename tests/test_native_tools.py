@@ -605,3 +605,189 @@ def test_async_session_lock_and_asend_do_not_block_other_sessions(tmp_path: Path
 
     asyncio.run(_run())
 
+
+# ---------------------------------------------------------------------------
+# 阶段 5：受控并行调度（只读并发、待办写与相关读写串行、并发上限、单项超时不连坐）
+# ---------------------------------------------------------------------------
+
+
+def test_parallel_weather_queries_execute_concurrently():
+    """核心场景：“同时查询北京、上海天气”，验证独立只读调用确实并发执行。"""
+
+    async def _run():
+        """验证两个各耗时 0.14s 的天气查询在一次批量调用中并发完成（总耗时显著小于串行 0.28s）。"""
+        active = 0
+        peak_active = 0
+
+        async def concurrent_aget(url: str) -> dict:
+            """模拟耗时 0.14s 的异步天气查询并统计并发峰值。"""
+            nonlocal active, peak_active
+            active += 1
+            peak_active = max(peak_active, active)
+            try:
+                await asyncio.sleep(0.14)
+                temp = "25" if "Beijing" in url else "28"
+                return {
+                    "current_condition": [
+                        {"temp_C": temp, "FeelsLikeC": temp, "humidity": "50", "weatherDesc": [{"value": "Sunny"}]}
+                    ]
+                }
+            finally:
+                active -= 1
+
+        reg = build_registry(http_get=concurrent_aget)
+        fake_llm = FakeLLM([
+            {
+                "content": "",
+                "tool_calls": [
+                    {"id": "call_bj", "name": "weather", "args": {"city": "Beijing"}},
+                    {"id": "call_sh", "name": "weather", "args": {"city": "Shanghai"}},
+                ],
+            },
+            "北京 25°C，上海 28°C。",
+        ])
+        agent = Agent(fake_llm, reg, tool_mode="native", parallel_tool_calls=True)
+        t0 = time.monotonic()
+        res = await agent.arun("同时查询北京、上海天气")
+        elapsed = time.monotonic() - t0
+
+        assert res.status == OK
+        assert peak_active == 2
+        assert elapsed < 0.25  # 串行至少 0.28s，并发约 0.14s
+        assert len(res.actions) == 2
+        assert res.actions[0].api_call_id == "call_bj" and '"temp_c": "25"' in res.actions[0].result
+        assert res.actions[1].api_call_id == "call_sh" and '"temp_c": "28"' in res.actions[1].result
+
+    asyncio.run(_run())
+
+
+def test_dependent_weather_then_todo_and_same_session_todo_writes_stay_serial(tmp_path: Path):
+    """核心场景：“查北京天气，再把结果记成待办”保持串行；同一批次内的待办写操作及相关读写也严格串行。"""
+
+    async def _run():
+        """验证跨步依赖（先查天气后写待办）与同批混合调用（并发读天气 + 串行写/读待办）均严格按序执行。"""
+        mgr = SessionManager(tmp_path / "sessions")
+        events_order: list[str] = []
+
+        async def tracked_aget(url: str) -> dict:
+            """记录天气请求顺序并返回不同城市的温度。"""
+            city = "Beijing" if "Beijing" in url else "Shanghai"
+            if city == "Beijing":
+                await asyncio.sleep(0.06)
+            else:
+                await asyncio.sleep(0.01)
+            events_order.append(f"weather:{city}")
+            return {
+                "current_condition": [
+                    {"temp_C": "21", "FeelsLikeC": "20", "humidity": "45", "weatherDesc": [{"value": "Cloudy"}]}
+                ]
+            }
+
+        # 1) 查北京天气 -> 根据结果记成待办（两步串行依赖）
+        llm_dep = FakeLLM([
+            {"content": "", "tool_calls": [{"id": "w_bj", "name": "weather", "args": {"city": "Beijing"}}]},
+            {"content": "", "tool_calls": [{"id": "t_add", "name": "todo", "args": {"action": "add", "text": "北京多云 21°C 记得带外套"}}]},
+            "已查询北京天气（21°C 多云）并记入待办 #1。",
+        ])
+        svc_dep = ChatService(llm_dep, mgr, lambda s: build_registry(todo_store=s, http_get=tracked_aget))
+        r_dep = await svc_dep.asend("u1", "s_dep", "查北京天气，再把结果记成待办", create=True)
+        assert r_dep.status == OK
+        assert [a.tool for a in r_dep.actions] == ["weather", "todo"]
+        with mgr.open("u1", "s_dep") as s:
+            assert s.data.todos["items"][0]["text"] == "北京多云 21°C 记得带外套"
+
+        # 2) 同一批次内包含 2 个只读 weather + 3 个相关 todo 操作（add #1 -> add #2 -> complete #1 -> list）
+        llm_mix = FakeLLM([
+            {
+                "content": "",
+                "tool_calls": [
+                    {"id": "m_w1", "name": "weather", "args": {"city": "Beijing"}},
+                    {"id": "m_w2", "name": "weather", "args": {"city": "Shanghai"}},
+                    {"id": "m_t1", "name": "todo", "args": {"action": "add", "text": "待办A"}},
+                    {"id": "m_t2", "name": "todo", "args": {"action": "add", "text": "待办B"}},
+                    {"id": "m_t3", "name": "todo", "args": {"action": "complete", "id": 1}},
+                    {"id": "m_t4", "name": "todo", "args": {"action": "list", "status": "all"}},
+                ],
+            },
+            "全部完成。",
+        ])
+        svc_mix = ChatService(llm_mix, mgr, lambda s: build_registry(todo_store=s, http_get=tracked_aget))
+        r_mix = await svc_mix.asend("u1", "s_mix", "查两城天气并依次操作待办", create=True)
+        assert r_mix.status == OK
+        assert len(r_mix.actions) == 6
+        # 验证最后一步 list 看到了前两步 add 和第三步 complete 的串行结果
+        list_res = json.loads(r_mix.actions[5].result)
+        assert len(list_res["items"]) == 2
+        assert list_res["items"][0] == {"id": 1, "text": "待办A", "done": True}
+        assert list_res["items"][1] == {"id": 2, "text": "待办B", "done": False}
+
+    asyncio.run(_run())
+
+
+def test_parallel_concurrency_limit_and_partial_timeout_preserves_other_results():
+    """核心场景：设置并发上限（max_concurrency=2），且一项查询超时时其他成功结果完整保留、每个调用都有明确结果。"""
+
+    async def _run():
+        """验证 4 个并发只读调用受 max_concurrency=2 限制，且 SlowCity 超时不影响其余 3 个城市成功返回。"""
+        active = 0
+        max_active = 0
+
+        async def bounded_aget(url: str) -> dict:
+            """统计并发度；SlowCity 延迟 0.25s 触发超时，其余城市 0.03s 正常返回。"""
+            nonlocal active, max_active
+            active += 1
+            max_active = max(max_active, active)
+            try:
+                if "SlowCity" in url:
+                    await asyncio.sleep(0.25)
+                else:
+                    await asyncio.sleep(0.03)
+                return {
+                    "current_condition": [
+                        {"temp_C": "26", "FeelsLikeC": "26", "humidity": "60", "weatherDesc": [{"value": "Fine"}]}
+                    ]
+                }
+            finally:
+                active -= 1
+
+        reg = build_registry(http_get=bounded_aget)
+        fake_llm = FakeLLM([
+            {
+                "content": "",
+                "tool_calls": [
+                    {"id": "c_bj", "name": "weather", "args": {"city": "Beijing"}},
+                    {"id": "c_slow", "name": "weather", "args": {"city": "SlowCity"}},
+                    {"id": "c_gz", "name": "weather", "args": {"city": "Guangzhou"}},
+                    {"id": "c_sz", "name": "weather", "args": {"city": "Shenzhen"}},
+                ],
+            },
+            "北京、广州、深圳均为 26°C，SlowCity 查询超时。",
+        ])
+        agent = Agent(
+            fake_llm,
+            reg,
+            tool_mode="native",
+            parallel_tool_calls=True,
+            tool_timeout=0.07,
+            max_concurrency=2,
+        )
+        res = await agent.arun("查四个城市天气")
+        assert res.status == OK
+        assert max_active == 2  # 严格遵守并发上限 2
+        assert len(res.actions) == 4
+
+        by_id = {a.api_call_id: a for a in res.actions}
+        assert by_id["c_bj"].ok is True and '"city": "Beijing"' in by_id["c_bj"].result
+        assert by_id["c_gz"].ok is True and '"city": "Guangzhou"' in by_id["c_gz"].result
+        assert by_id["c_sz"].ok is True and '"city": "Shenzhen"' in by_id["c_sz"].result
+        assert by_id["c_slow"].ok is False and "timed out" in by_id["c_slow"].result
+
+        # 验证回填的 role=tool 消息与每个 tool_call_id 一一对应
+        tool_msgs = {m["tool_call_id"]: m for m in res.messages if m.get("role") == "tool"}
+        assert set(tool_msgs) == {"c_bj", "c_slow", "c_gz", "c_sz"}
+        assert '"city": "Beijing"' in tool_msgs["c_bj"]["content"]
+        assert "Error:" in tool_msgs["c_slow"]["content"] and "timed out" in tool_msgs["c_slow"]["content"]
+
+    asyncio.run(_run())
+
+

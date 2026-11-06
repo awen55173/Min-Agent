@@ -16,7 +16,7 @@ from .context import (
     estimate_tokens,
     truncate_to_tokens,
 )
-from .llm import LLMClient, LLMError, LLMResponse, Message, normalize_llm_response
+from .llm import LLMClient, LLMError, LLMResponse, Message, ToolCallItem, normalize_llm_response
 from .parser import ParseError, parse_output, parse_tool_call_args
 from .prompt import build_system_prompt
 from .session import SessionError
@@ -110,6 +110,31 @@ async def _maybe_await(val: Any) -> Any:
     return val
 
 
+@dataclass
+class _BatchCallItem:
+    """单批原生工具调用中的一项及其运行时状态。"""
+
+    step: int
+    thought: str
+    tool_name: str
+    args: dict[str, Any]
+    api_call_id: str
+    call_id: str
+    write_op: bool
+    parallel_safe: bool
+    rec: dict[str, Any] = field(default_factory=dict)
+    reused: bool = False
+    reconciled_from_uncertain: bool = False
+    result_ok: bool = False
+    result_content: str = ""
+    duration_ms: float = 0.0
+    request_logged: bool = False
+    result_logged: bool = False
+    completed: bool = False
+    message_appended: bool = False
+    action_appended: bool = False
+
+
 class Agent:
     """最小 Agent：支持同步与异步、原生函数工具调用（主路径）与文本模式（兼容选项）的 ReAct 循环。"""
 
@@ -122,12 +147,15 @@ class Agent:
         max_context_tokens: int = DEFAULT_CONTEXT_TOKENS,
         trace_logger: TraceLogger | None = None,
         tool_mode: str = "native",
-        parallel_tool_calls: bool = False,
+        parallel_tool_calls: bool = True,
         tool_timeout: float | None = None,
+        max_concurrency: int = 4,
     ):
-        """保存依赖与预算：默认使用 native 原生工具调用模式，可配置工具超时与并发开关。"""
+        """保存依赖与预算：默认使用 native 原生工具调用模式与受控并行调度，可配置工具超时与并发上限。"""
         if tool_mode not in ("native", "text"):
             raise ValueError(f"unsupported tool_mode: {tool_mode!r} (expected 'native' or 'text')")
+        if max_concurrency < 1:
+            raise ValueError(f"max_concurrency must be >= 1, got {max_concurrency}")
         self._llm = llm
         self._registry = registry
         self._max_steps = max_steps
@@ -137,8 +165,10 @@ class Agent:
         self._tool_mode = tool_mode
         self._parallel_tool_calls = parallel_tool_calls
         self._tool_timeout = tool_timeout
-        self._pending: str | None = None  # 正在执行的工具名
-        self._pending_record: dict[str, Any] | None = None  # 正在执行的工具调用记录
+        self._max_concurrency = max_concurrency
+        self._pending: str | None = None  # 正在执行的工具名（单步文本模式）
+        self._pending_record: dict[str, Any] | None = None  # 正在执行的工具调用记录（单步文本模式）
+        self._active_batch: list[_BatchCallItem] | None = None  # 正在执行的原生批量工具调用项
 
     def _effective_tool_mode(self) -> str:
         """确定实际运行的工具模式：显式 text 时走文本模式；native 时若模拟客户端仅支持纯文本则自动兼容。"""
@@ -454,7 +484,83 @@ class Agent:
         attempt: int | str,
         mode: str,
     ) -> None:
-        """在同步或异步中断时把执行中的工具标记为 interrupted 并补齐配对消息与 Trace 事件。"""
+        """在同步或异步中断时把执行中的单步或批量工具标记为 interrupted 并补齐配对消息与 Trace 事件。"""
+        active_batch = self._active_batch
+        self._active_batch = None
+        if active_batch is not None:
+            turn_id = ctx.turn_id if ctx.turn_id is not None else "default"
+            for it in active_batch:
+                if it.completed:
+                    if not it.result_logged:
+                        self._emit_batch_item_result(it, ctx, turn_id, attempt, logger, trace_events)
+                    if not it.message_appended:
+                        messages.append(
+                            _build_native_tool_message(it.api_call_id, it.tool_name, it.result_ok, it.result_content)
+                        )
+                        it.message_appended = True
+                    if not it.action_appended:
+                        actions.append(
+                            ActionRecord(
+                                it.step, it.thought, it.tool_name, it.args,
+                                it.result_ok, it.result_content,
+                                call_id=it.call_id, duration_ms=it.duration_ms,
+                                reused=it.reused, api_call_id=it.api_call_id,
+                            )
+                        )
+                        it.action_appended = True
+                else:
+                    if not it.request_logged:
+                        self._emit_batch_item_request(it, ctx, turn_id, attempt, logger, trace_events)
+                    if it.rec:
+                        it.rec["status"] = "interrupted"
+                        it.rec["error"] = "interrupted during tool execution"
+                    if not it.result_logged:
+                        if logger is not None:
+                            ev = logger.log_tool_result(
+                                ctx.user_id, ctx.session_id, turn_id, it.step, it.call_id,
+                                it.thought, it.tool_name, it.args, False, "interrupted", "", 0.0,
+                                error="interrupted during tool execution",
+                                attempt_id=attempt, api_call_id=it.api_call_id,
+                            )
+                        else:
+                            ev = {
+                                "event": "tool_result",
+                                "user_id": ctx.user_id,
+                                "session_id": ctx.session_id,
+                                "turn_id": turn_id,
+                                "attempt_id": attempt,
+                                "step": it.step,
+                                "call_id": it.call_id,
+                                "api_call_id": it.api_call_id,
+                                "thought": it.thought,
+                                "tool": it.tool_name,
+                                "args": it.args,
+                                "ok": False,
+                                "status": "interrupted",
+                                "result": "",
+                                "error": "interrupted during tool execution",
+                                "duration_ms": 0.0,
+                                "reused": False,
+                            }
+                        trace_events.append(ev)
+                        it.result_logged = True
+                    if not it.message_appended:
+                        interrupted_text = (
+                            f"Observation (tool={it.tool_name}, status=interrupted): the run was interrupted while "
+                            "this tool was executing; it may or may not have taken effect. Check the current state "
+                            "(e.g. list todos) before retrying."
+                        )
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": it.api_call_id,
+                            "name": it.tool_name,
+                            "content": interrupted_text,
+                        })
+                        it.message_appended = True
+            self._pending = None
+            self._pending_record = None
+            return
+
         pending = self._pending
         pending_rec = self._pending_record
         self._pending = None
@@ -1029,6 +1135,598 @@ class Agent:
         trace_events.append(res_ev)
         return result_ok, None
 
+    def _is_parallel_safe(self, tool_name: str, args: dict[str, Any], batch_has_todo_write: bool) -> bool:
+        """判断单个工具调用是否可放入受控并行段：仅无依赖只读工具可并发，待办写及同批相关读写保持串行。"""
+        if is_write_tool(tool_name, args):
+            return False
+        if tool_name == "todo":
+            return not batch_has_todo_write
+        tool = self._registry.get(tool_name)
+        return bool(tool is not None and getattr(tool, "read_only", True))
+
+    def _prepare_batch_items(
+        self,
+        raw_calls: list[ToolCallItem],
+        thought: str,
+        actions: list[ActionRecord],
+        ctx: ToolContext,
+        turn_id: TurnId,
+    ) -> tuple[list[_BatchCallItem], bool]:
+        """校验整批工具调用参数，按剩余步数预算裁剪并预分配确定性的 step、api_call_id 与幂等 call_id。"""
+        parsed_calls: list[tuple[str, str, dict[str, Any]]] = []
+        for tc in raw_calls:
+            args = parse_tool_call_args(tc.name, tc.arguments, self._registry)
+            parsed_calls.append((tc.id, tc.name, args))
+
+        remaining = self._max_steps - len(actions)
+        if remaining <= 0:
+            return [], True
+        budget_exceeded = len(parsed_calls) > remaining
+        allowed_calls = parsed_calls[:remaining]
+        batch_has_todo_write = any(is_write_tool(name, args) for _, name, args in allowed_calls)
+
+        prior_pairs: list[tuple[str, dict[str, Any]]] = [
+            (a.tool, _normalize_args(a.tool, a.args)) for a in actions
+        ]
+        items: list[_BatchCallItem] = []
+        for idx, (raw_id, tool_name, args) in enumerate(allowed_calls, start=1):
+            step = len(actions) + idx
+            api_call_id = raw_id or f"call_{step}"
+            norm_target = _normalize_args(tool_name, args)
+            occurrence = sum(1 for t_name, n_args in prior_pairs if t_name == tool_name and n_args == norm_target) + 1
+            prior_pairs.append((tool_name, norm_target))
+            call_id = make_call_id(ctx.user_id, ctx.session_id, turn_id, tool_name, args, occurrence)
+            write_op = is_write_tool(tool_name, args)
+            parallel_safe = self._is_parallel_safe(tool_name, args, batch_has_todo_write)
+            items.append(
+                _BatchCallItem(
+                    step=step,
+                    thought=thought,
+                    tool_name=tool_name,
+                    args=args,
+                    api_call_id=api_call_id,
+                    call_id=call_id,
+                    write_op=write_op,
+                    parallel_safe=parallel_safe,
+                )
+            )
+        return items, budget_exceeded
+
+    @staticmethod
+    def _partition_batch_segments(batch_items: list[_BatchCallItem]) -> list[tuple[str, list[_BatchCallItem]]]:
+        """将一批工具调用切分为受控执行段：连续只读无依赖项合并为 parallel 段，写操作或相关读写项各自为 serial 段。"""
+        segments: list[tuple[str, list[_BatchCallItem]]] = []
+        for it in batch_items:
+            if not it.parallel_safe:
+                segments.append(("serial", [it]))
+            elif segments and segments[-1][0] == "parallel":
+                segments[-1][1].append(it)
+            else:
+                segments.append(("parallel", [it]))
+        return segments
+
+    def _emit_batch_item_request(
+        self,
+        it: _BatchCallItem,
+        ctx: ToolContext,
+        turn_id: TurnId,
+        attempt: int | str,
+        logger: TraceLogger | None,
+        trace_events: list[dict[str, Any]],
+    ) -> None:
+        """为批量调用中的单项记录 tool_request Trace 事件。"""
+        if it.request_logged:
+            return
+        if logger is not None:
+            req_ev = logger.log_tool_request(
+                ctx.user_id, ctx.session_id, turn_id, it.step, it.call_id,
+                it.thought, it.tool_name, it.args, attempt_id=attempt, api_call_id=it.api_call_id,
+            )
+        else:
+            req_ev = {
+                "event": "tool_request",
+                "user_id": ctx.user_id,
+                "session_id": ctx.session_id,
+                "turn_id": turn_id,
+                "attempt_id": attempt,
+                "step": it.step,
+                "call_id": it.call_id,
+                "api_call_id": it.api_call_id,
+                "thought": it.thought,
+                "tool": it.tool_name,
+                "args": it.args,
+                "status": "started",
+            }
+        trace_events.append(req_ev)
+        it.request_logged = True
+
+    def _emit_batch_item_result(
+        self,
+        it: _BatchCallItem,
+        ctx: ToolContext,
+        turn_id: TurnId,
+        attempt: int | str,
+        logger: TraceLogger | None,
+        trace_events: list[dict[str, Any]],
+        error_override: str | None = None,
+    ) -> None:
+        """为批量调用中的单项记录 tool_result Trace 事件。"""
+        if it.result_logged:
+            return
+        ok = False if error_override is not None else it.result_ok
+        status_str = "error" if not ok else "ok"
+        err_str = error_override if error_override is not None else (None if ok else it.result_content)
+        if logger is not None:
+            res_ev = logger.log_tool_result(
+                ctx.user_id, ctx.session_id, turn_id, it.step, it.call_id,
+                it.thought, it.tool_name, it.args,
+                ok, status_str, it.result_content, it.duration_ms,
+                error=err_str, reused=it.reused, attempt_id=attempt, api_call_id=it.api_call_id,
+            )
+        else:
+            res_ev = {
+                "event": "tool_result",
+                "user_id": ctx.user_id,
+                "session_id": ctx.session_id,
+                "turn_id": turn_id,
+                "attempt_id": attempt,
+                "step": it.step,
+                "call_id": it.call_id,
+                "api_call_id": it.api_call_id,
+                "thought": it.thought,
+                "tool": it.tool_name,
+                "args": it.args,
+                "ok": ok,
+                "status": status_str,
+                "result": it.result_content,
+                "error": err_str,
+                "duration_ms": it.duration_ms,
+                "reused": it.reused,
+            }
+        trace_events.append(res_ev)
+        it.result_logged = True
+
+    def _try_reuse_batch_item(
+        self,
+        it: _BatchCallItem,
+        records: list[dict[str, Any]],
+        todo_store: TodoStore | None,
+        ctx: ToolContext,
+        turn_id: TurnId,
+    ) -> bool:
+        """按内部幂等 call_id 检查批量项是否可复用已完成结果或从不确定状态核对恢复。"""
+        existing = _find_call_record(records, it.call_id)
+        is_todo_list = it.tool_name == "todo" and it.args.get("action") == "list"
+        if existing is None or is_todo_list:
+            return False
+        prev_status = existing.get("status")
+        reused = False
+        reconciled_from_uncertain = False
+        result_ok = False
+        result_content = ""
+        if prev_status == "ok":
+            todos_snapshot = todo_store.export_state(ctx) if todo_store is not None else None
+            reconciled = reconcile_todo_call(existing, todos_snapshot, turn_id)
+            if reconciled is not None:
+                reused = True
+                result_ok, result_content = reconciled
+            elif existing.get("result"):
+                reused = True
+                result_ok, result_content = True, str(existing["result"])
+        elif prev_status in ("pending", "interrupted"):
+            todos_snapshot = todo_store.export_state(ctx) if todo_store is not None else None
+            reconciled = reconcile_todo_call(existing, todos_snapshot, turn_id)
+            if reconciled is not None:
+                reused = True
+                reconciled_from_uncertain = True
+                result_ok, result_content = reconciled
+                existing["status"] = "ok"
+                existing["result"] = result_content
+                existing["error"] = None
+                existing["step"] = it.step
+        if not reused:
+            return False
+        if it.api_call_id:
+            existing["api_call_id"] = it.api_call_id
+        it.rec = existing
+        it.reused = True
+        it.reconciled_from_uncertain = reconciled_from_uncertain
+        it.result_ok = result_ok
+        it.result_content = result_content
+        it.completed = True
+        return True
+
+    async def _arun_parallel_segment(
+        self,
+        to_run: list[_BatchCallItem],
+        ctx: ToolContext,
+        turn_id: TurnId,
+        attempt: int | str,
+        logger: TraceLogger | None,
+        trace_events: list[dict[str, Any]],
+    ) -> None:
+        """在并发信号量上限内异步并发执行一组无依赖只读工具；单项超时或错误不影响同批其他调用。"""
+        sem = asyncio.Semaphore(self._max_concurrency)
+
+        async def _worker(it: _BatchCallItem) -> None:
+            """受信号量保护执行单个只读工具并记录结果。"""
+            async with sem:
+                t0 = time.perf_counter()
+                res = await self._registry.aexecute(it.tool_name, it.args, ctx, timeout=self._tool_timeout)
+                it.duration_ms = round((time.perf_counter() - t0) * 1000, 3)
+                it.result_ok = res.ok
+                it.result_content = res.content
+                it.rec["status"] = "ok" if res.ok else "error"
+                it.rec["result"] = res.content
+                it.rec["error"] = None if res.ok else res.content
+                it.rec["duration_ms"] = it.duration_ms
+                it.completed = True
+                self._emit_batch_item_result(it, ctx, turn_id, attempt, logger, trace_events)
+
+        tasks = [asyncio.create_task(_worker(it)) for it in to_run]
+        try:
+            await asyncio.gather(*tasks)
+        except BaseException:
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+
+    def _handle_batch_persist_failure(
+        self,
+        failed_item: _BatchCallItem,
+        batch_items: list[_BatchCallItem],
+        prev_todos: dict[str, Any] | None,
+        todo_store: TodoStore | None,
+        ctx: ToolContext,
+        turn_id: TurnId,
+        attempt: int | str,
+        messages: list[Message],
+        logger: TraceLogger | None,
+        trace_events: list[dict[str, Any]],
+        err: Exception,
+    ) -> None:
+        """处理批量执行中待办写操作即时落盘失败：回滚未落盘待办并保持消息配对完整。"""
+        if prev_todos is not None and todo_store is not None:
+            todo_store.load_state(ctx, prev_todos)
+        err_msg = f"persist failed: {err}"
+        failed_item.rec["status"] = "error"
+        failed_item.rec["error"] = err_msg
+        self._emit_batch_item_result(
+            failed_item, ctx, turn_id, attempt, logger, trace_events, error_override=err_msg,
+        )
+        other_completed = any(x.completed and x is not failed_item for x in batch_items)
+        if not other_completed:
+            # 本批尚无其他已完成项：直接弹出刚追加的 tool 消息与本批 assistant 消息
+            if failed_item.message_appended and messages and messages[-1].get("role") == "tool":
+                messages.pop()
+                failed_item.message_appended = False
+            if messages and messages[-1].get("role") == "assistant":
+                messages.pop()
+        else:
+            # 本批已有先前的完成项：保留 assistant 消息，把失败项及后续未执行项补齐 tool 错误消息以保证配对
+            if failed_item.message_appended and messages and messages[-1].get("role") == "tool":
+                messages[-1] = _build_native_tool_message(
+                    failed_item.api_call_id, failed_item.tool_name, False, err_msg,
+                )
+            for rem in batch_items:
+                if not rem.message_appended:
+                    messages.append(
+                        _build_native_tool_message(
+                            rem.api_call_id, rem.tool_name, False, "not executed due to earlier persist failure",
+                        )
+                    )
+                    rem.message_appended = True
+        self._active_batch = None
+
+    def _execute_native_batch(
+        self,
+        *,
+        batch_items: list[_BatchCallItem],
+        assistant_msg: Message,
+        messages: list[Message],
+        ctx: ToolContext,
+        turn_id: TurnId,
+        actions: list[ActionRecord],
+        records: list[dict[str, Any]],
+        todo_store: TodoStore | None,
+        on_step_change: Callable[[list[Message], dict[str, Any], bool], Any] | None,
+        logger: TraceLogger | None,
+        trace_events: list[dict[str, Any]],
+        attempt: int | str,
+    ) -> tuple[bool, str | None]:
+        """同步路径下按受控并行段与串行写操作段执行一批原生工具调用。"""
+        messages.append(assistant_msg)
+        self._active_batch = batch_items
+        segments = self._partition_batch_segments(batch_items)
+
+        for seg_kind, seg_items in segments:
+            if seg_kind == "serial":
+                it = seg_items[0]
+                self._emit_batch_item_request(it, ctx, turn_id, attempt, logger, trace_events)
+                if self._try_reuse_batch_item(it, records, todo_store, ctx, turn_id):
+                    messages.append(_build_native_tool_message(it.api_call_id, it.tool_name, True, it.result_content))
+                    it.message_appended = True
+                    if on_step_change is not None and it.rec:
+                        on_step_change(messages, it.rec, it.reconciled_from_uncertain and it.write_op)
+                    actions.append(
+                        ActionRecord(
+                            it.step, it.thought, it.tool_name, it.args,
+                            it.result_ok, it.result_content,
+                            call_id=it.call_id, duration_ms=it.duration_ms,
+                            reused=True, api_call_id=it.api_call_id,
+                        )
+                    )
+                    it.action_appended = True
+                    self._emit_batch_item_result(it, ctx, turn_id, attempt, logger, trace_events)
+                else:
+                    it.rec = _upsert_call_record(
+                        records,
+                        ToolCallRecord(
+                            call_id=it.call_id,
+                            user_id=ctx.user_id,
+                            session_id=ctx.session_id,
+                            turn_id=turn_id,
+                            step=it.step,
+                            tool=it.tool_name,
+                            args=it.args,
+                            status="pending",
+                            api_call_id=it.api_call_id,
+                        ).to_dict(),
+                    )
+                    if on_step_change is not None:
+                        on_step_change(messages, it.rec, False)
+                    prev_todos = (
+                        copy.deepcopy(todo_store.export_state(ctx))
+                        if (it.write_op and todo_store is not None)
+                        else None
+                    )
+                    t0 = time.perf_counter()
+                    if self._tool_timeout is not None:
+                        res = asyncio.run(
+                            self._registry.aexecute(it.tool_name, it.args, ctx, timeout=self._tool_timeout)
+                        )
+                    else:
+                        res = self._registry.execute(it.tool_name, it.args, ctx)
+                    it.duration_ms = round((time.perf_counter() - t0) * 1000, 3)
+                    it.result_ok = res.ok
+                    it.result_content = res.content
+                    it.rec["status"] = "ok" if res.ok else "error"
+                    it.rec["result"] = res.content
+                    it.rec["error"] = None if res.ok else res.content
+                    it.rec["duration_ms"] = it.duration_ms
+                    it.completed = True
+
+                    messages.append(
+                        _build_native_tool_message(it.api_call_id, it.tool_name, it.result_ok, it.result_content)
+                    )
+                    it.message_appended = True
+                    if on_step_change is not None:
+                        try:
+                            on_step_change(messages, it.rec, it.write_op and it.result_ok)
+                        except (OSError, SessionError) as e:
+                            self._handle_batch_persist_failure(
+                                it, batch_items, prev_todos, todo_store, ctx, turn_id,
+                                attempt, messages, logger, trace_events, e,
+                            )
+                            return False, str(e)
+                    actions.append(
+                        ActionRecord(
+                            it.step, it.thought, it.tool_name, it.args,
+                            it.result_ok, it.result_content,
+                            call_id=it.call_id, duration_ms=it.duration_ms,
+                            reused=False, api_call_id=it.api_call_id,
+                        )
+                    )
+                    it.action_appended = True
+                    self._emit_batch_item_result(it, ctx, turn_id, attempt, logger, trace_events)
+            else:
+                to_run: list[_BatchCallItem] = []
+                for it in seg_items:
+                    self._emit_batch_item_request(it, ctx, turn_id, attempt, logger, trace_events)
+                    if self._try_reuse_batch_item(it, records, todo_store, ctx, turn_id):
+                        self._emit_batch_item_result(it, ctx, turn_id, attempt, logger, trace_events)
+                    else:
+                        it.rec = _upsert_call_record(
+                            records,
+                            ToolCallRecord(
+                                call_id=it.call_id,
+                                user_id=ctx.user_id,
+                                session_id=ctx.session_id,
+                                turn_id=turn_id,
+                                step=it.step,
+                                tool=it.tool_name,
+                                args=it.args,
+                                status="pending",
+                                api_call_id=it.api_call_id,
+                            ).to_dict(),
+                        )
+                        to_run.append(it)
+                if to_run:
+                    if on_step_change is not None:
+                        on_step_change(messages, to_run[-1].rec, False)
+                    if len(to_run) == 1 and self._tool_timeout is None:
+                        it = to_run[0]
+                        t0 = time.perf_counter()
+                        res = self._registry.execute(it.tool_name, it.args, ctx)
+                        it.duration_ms = round((time.perf_counter() - t0) * 1000, 3)
+                        it.result_ok = res.ok
+                        it.result_content = res.content
+                        it.rec["status"] = "ok" if res.ok else "error"
+                        it.rec["result"] = res.content
+                        it.rec["error"] = None if res.ok else res.content
+                        it.rec["duration_ms"] = it.duration_ms
+                        it.completed = True
+                        self._emit_batch_item_result(it, ctx, turn_id, attempt, logger, trace_events)
+                    else:
+                        asyncio.run(
+                            self._arun_parallel_segment(to_run, ctx, turn_id, attempt, logger, trace_events)
+                        )
+                for it in seg_items:
+                    messages.append(
+                        _build_native_tool_message(it.api_call_id, it.tool_name, it.result_ok, it.result_content)
+                    )
+                    it.message_appended = True
+                    actions.append(
+                        ActionRecord(
+                            it.step, it.thought, it.tool_name, it.args,
+                            it.result_ok, it.result_content,
+                            call_id=it.call_id, duration_ms=it.duration_ms,
+                            reused=it.reused, api_call_id=it.api_call_id,
+                        )
+                    )
+                    it.action_appended = True
+                if on_step_change is not None and seg_items:
+                    on_step_change(messages, seg_items[-1].rec, False)
+
+        self._active_batch = None
+        return any(it.result_ok for it in batch_items), None
+
+    async def _aexecute_native_batch(
+        self,
+        *,
+        batch_items: list[_BatchCallItem],
+        assistant_msg: Message,
+        messages: list[Message],
+        ctx: ToolContext,
+        turn_id: TurnId,
+        actions: list[ActionRecord],
+        records: list[dict[str, Any]],
+        todo_store: TodoStore | None,
+        on_step_change: Callable[[list[Message], dict[str, Any], bool], Any] | None,
+        logger: TraceLogger | None,
+        trace_events: list[dict[str, Any]],
+        attempt: int | str,
+    ) -> tuple[bool, str | None]:
+        """异步路径下按受控并行段与串行写操作段执行一批原生工具调用。"""
+        messages.append(assistant_msg)
+        self._active_batch = batch_items
+        segments = self._partition_batch_segments(batch_items)
+
+        for seg_kind, seg_items in segments:
+            if seg_kind == "serial":
+                it = seg_items[0]
+                self._emit_batch_item_request(it, ctx, turn_id, attempt, logger, trace_events)
+                if self._try_reuse_batch_item(it, records, todo_store, ctx, turn_id):
+                    messages.append(_build_native_tool_message(it.api_call_id, it.tool_name, True, it.result_content))
+                    it.message_appended = True
+                    if on_step_change is not None and it.rec:
+                        await _maybe_await(
+                            on_step_change(messages, it.rec, it.reconciled_from_uncertain and it.write_op)
+                        )
+                    actions.append(
+                        ActionRecord(
+                            it.step, it.thought, it.tool_name, it.args,
+                            it.result_ok, it.result_content,
+                            call_id=it.call_id, duration_ms=it.duration_ms,
+                            reused=True, api_call_id=it.api_call_id,
+                        )
+                    )
+                    it.action_appended = True
+                    self._emit_batch_item_result(it, ctx, turn_id, attempt, logger, trace_events)
+                else:
+                    it.rec = _upsert_call_record(
+                        records,
+                        ToolCallRecord(
+                            call_id=it.call_id,
+                            user_id=ctx.user_id,
+                            session_id=ctx.session_id,
+                            turn_id=turn_id,
+                            step=it.step,
+                            tool=it.tool_name,
+                            args=it.args,
+                            status="pending",
+                            api_call_id=it.api_call_id,
+                        ).to_dict(),
+                    )
+                    if on_step_change is not None:
+                        await _maybe_await(on_step_change(messages, it.rec, False))
+                    prev_todos = (
+                        copy.deepcopy(todo_store.export_state(ctx))
+                        if (it.write_op and todo_store is not None)
+                        else None
+                    )
+                    t0 = time.perf_counter()
+                    res = await self._registry.aexecute(it.tool_name, it.args, ctx, timeout=self._tool_timeout)
+                    it.duration_ms = round((time.perf_counter() - t0) * 1000, 3)
+                    it.result_ok = res.ok
+                    it.result_content = res.content
+                    it.rec["status"] = "ok" if res.ok else "error"
+                    it.rec["result"] = res.content
+                    it.rec["error"] = None if res.ok else res.content
+                    it.rec["duration_ms"] = it.duration_ms
+                    it.completed = True
+
+                    messages.append(
+                        _build_native_tool_message(it.api_call_id, it.tool_name, it.result_ok, it.result_content)
+                    )
+                    it.message_appended = True
+                    if on_step_change is not None:
+                        try:
+                            await _maybe_await(on_step_change(messages, it.rec, it.write_op and it.result_ok))
+                        except (OSError, SessionError) as e:
+                            self._handle_batch_persist_failure(
+                                it, batch_items, prev_todos, todo_store, ctx, turn_id,
+                                attempt, messages, logger, trace_events, e,
+                            )
+                            return False, str(e)
+                    actions.append(
+                        ActionRecord(
+                            it.step, it.thought, it.tool_name, it.args,
+                            it.result_ok, it.result_content,
+                            call_id=it.call_id, duration_ms=it.duration_ms,
+                            reused=False, api_call_id=it.api_call_id,
+                        )
+                    )
+                    it.action_appended = True
+                    self._emit_batch_item_result(it, ctx, turn_id, attempt, logger, trace_events)
+            else:
+                to_run: list[_BatchCallItem] = []
+                for it in seg_items:
+                    self._emit_batch_item_request(it, ctx, turn_id, attempt, logger, trace_events)
+                    if self._try_reuse_batch_item(it, records, todo_store, ctx, turn_id):
+                        self._emit_batch_item_result(it, ctx, turn_id, attempt, logger, trace_events)
+                    else:
+                        it.rec = _upsert_call_record(
+                            records,
+                            ToolCallRecord(
+                                call_id=it.call_id,
+                                user_id=ctx.user_id,
+                                session_id=ctx.session_id,
+                                turn_id=turn_id,
+                                step=it.step,
+                                tool=it.tool_name,
+                                args=it.args,
+                                status="pending",
+                                api_call_id=it.api_call_id,
+                            ).to_dict(),
+                        )
+                        to_run.append(it)
+                if to_run:
+                    if on_step_change is not None:
+                        await _maybe_await(on_step_change(messages, to_run[-1].rec, False))
+                    await self._arun_parallel_segment(to_run, ctx, turn_id, attempt, logger, trace_events)
+                for it in seg_items:
+                    messages.append(
+                        _build_native_tool_message(it.api_call_id, it.tool_name, it.result_ok, it.result_content)
+                    )
+                    it.message_appended = True
+                    actions.append(
+                        ActionRecord(
+                            it.step, it.thought, it.tool_name, it.args,
+                            it.result_ok, it.result_content,
+                            call_id=it.call_id, duration_ms=it.duration_ms,
+                            reused=it.reused, api_call_id=it.api_call_id,
+                        )
+                    )
+                    it.action_appended = True
+                if on_step_change is not None and seg_items:
+                    await _maybe_await(on_step_change(messages, seg_items[-1].rec, False))
+
+        self._active_batch = None
+        return any(it.result_ok for it in batch_items), None
+
     def _loop_native(
         self,
         messages: list[Message],
@@ -1042,7 +1740,7 @@ class Agent:
         attempt: int | str,
         finish,
     ) -> AgentResult:
-        """同步原生工具调用主循环：读取模型 tool_calls（工具名、参数、调用 ID），执行后按 role=tool 协议回填。"""
+        """同步原生工具调用主循环：支持单步或受控并行批量工具调用，执行后按 role=tool 协议回填。"""
         parse_failures = 0
         unexecuted_tool_output = False
         turn_id = ctx.turn_id if ctx.turn_id is not None else "default"
@@ -1050,6 +1748,7 @@ class Agent:
         while True:
             self._pending = None
             self._pending_record = None
+            self._active_batch = None
             try:
                 check_context_budget(messages, self._max_context_tokens)
                 resp = self._call_llm_native(messages)
@@ -1119,9 +1818,11 @@ class Agent:
                 })
                 continue
 
-            tc = resp.tool_calls[0]
+            thought = (resp.content or "").strip()
             try:
-                args = parse_tool_call_args(tc.name, tc.arguments, self._registry)
+                batch_items, budget_exceeded = self._prepare_batch_items(
+                    resp.tool_calls, thought, actions, ctx, turn_id,
+                )
             except ParseError as e:
                 unexecuted_tool_output = True
                 parse_failures += 1
@@ -1144,38 +1845,31 @@ class Agent:
                 continue
 
             parse_failures = 0
-            if len(actions) >= self._max_steps:
+            if not batch_items:
                 return finish(
                     MAX_STEPS,
                     f"已达最大步数（{self._max_steps}），任务可能未完成。\n"
                     f"{_summarize(actions, '达到工具调用步数上限，尚未得出最终回复。')}",
                 )
 
-            step = len(actions) + 1
-            api_call_id = tc.id or f"call_{step}"
-            thought = (resp.content or "").strip()
             assistant_msg: Message = {
                 "role": "assistant",
                 "content": resp.content or "",
                 "tool_calls": [
                     {
-                        "id": api_call_id,
+                        "id": it.api_call_id,
                         "type": "function",
                         "function": {
-                            "name": tc.name,
-                            "arguments": json.dumps(args, ensure_ascii=False),
+                            "name": it.tool_name,
+                            "arguments": json.dumps(it.args, ensure_ascii=False),
                         },
                     }
+                    for it in batch_items
                 ],
             }
-            step_ok, persist_err = self._execute_tool_step(
-                step=step,
-                thought=thought,
-                tool_name=tc.name,
-                tool_args=args,
-                api_call_id=api_call_id,
+            any_ok, persist_err = self._execute_native_batch(
+                batch_items=batch_items,
                 assistant_msg=assistant_msg,
-                mode="native",
                 messages=messages,
                 ctx=ctx,
                 turn_id=turn_id,
@@ -1192,8 +1886,14 @@ class Agent:
                     PERSIST_FAILED,
                     f"保存写操作失败：{persist_err}\n{_summarize(actions, '写操作未能落盘，已回滚本次未保存的变更。')}",
                 )
-            if step_ok:
+            if any_ok:
                 unexecuted_tool_output = False
+            if budget_exceeded:
+                return finish(
+                    MAX_STEPS,
+                    f"已达最大步数（{self._max_steps}），任务可能未完成。\n"
+                    f"{_summarize(actions, '批量工具调用超出剩余步数预算，后续调用未继续执行。')}",
+                )
 
     async def _aloop_native(
         self,
@@ -1208,7 +1908,7 @@ class Agent:
         attempt: int | str,
         afinish,
     ) -> AgentResult:
-        """异步原生工具调用主循环：异步调用模型与工具，支持超时、取消传播与即时异步落盘。"""
+        """异步原生工具调用主循环：支持受控并行批量工具调用、超时、取消传播与即时异步落盘。"""
         parse_failures = 0
         unexecuted_tool_output = False
         turn_id = ctx.turn_id if ctx.turn_id is not None else "default"
@@ -1216,6 +1916,7 @@ class Agent:
         while True:
             self._pending = None
             self._pending_record = None
+            self._active_batch = None
             try:
                 check_context_budget(messages, self._max_context_tokens)
                 resp = await self._acall_llm_native(messages)
@@ -1285,9 +1986,11 @@ class Agent:
                 })
                 continue
 
-            tc = resp.tool_calls[0]
+            thought = (resp.content or "").strip()
             try:
-                args = parse_tool_call_args(tc.name, tc.arguments, self._registry)
+                batch_items, budget_exceeded = self._prepare_batch_items(
+                    resp.tool_calls, thought, actions, ctx, turn_id,
+                )
             except ParseError as e:
                 unexecuted_tool_output = True
                 parse_failures += 1
@@ -1310,38 +2013,31 @@ class Agent:
                 continue
 
             parse_failures = 0
-            if len(actions) >= self._max_steps:
+            if not batch_items:
                 return await afinish(
                     MAX_STEPS,
                     f"已达最大步数（{self._max_steps}），任务可能未完成。\n"
                     f"{_summarize(actions, '达到工具调用步数上限，尚未得出最终回复。')}",
                 )
 
-            step = len(actions) + 1
-            api_call_id = tc.id or f"call_{step}"
-            thought = (resp.content or "").strip()
             assistant_msg: Message = {
                 "role": "assistant",
                 "content": resp.content or "",
                 "tool_calls": [
                     {
-                        "id": api_call_id,
+                        "id": it.api_call_id,
                         "type": "function",
                         "function": {
-                            "name": tc.name,
-                            "arguments": json.dumps(args, ensure_ascii=False),
+                            "name": it.tool_name,
+                            "arguments": json.dumps(it.args, ensure_ascii=False),
                         },
                     }
+                    for it in batch_items
                 ],
             }
-            step_ok, persist_err = await self._aexecute_tool_step(
-                step=step,
-                thought=thought,
-                tool_name=tc.name,
-                tool_args=args,
-                api_call_id=api_call_id,
+            any_ok, persist_err = await self._aexecute_native_batch(
+                batch_items=batch_items,
                 assistant_msg=assistant_msg,
-                mode="native",
                 messages=messages,
                 ctx=ctx,
                 turn_id=turn_id,
@@ -1358,8 +2054,14 @@ class Agent:
                     PERSIST_FAILED,
                     f"保存写操作失败：{persist_err}\n{_summarize(actions, '写操作未能落盘，已回滚本次未保存的变更。')}",
                 )
-            if step_ok:
+            if any_ok:
                 unexecuted_tool_output = False
+            if budget_exceeded:
+                return await afinish(
+                    MAX_STEPS,
+                    f"已达最大步数（{self._max_steps}），任务可能未完成。\n"
+                    f"{_summarize(actions, '批量工具调用超出剩余步数预算，后续调用未继续执行。')}",
+                )
 
     def _loop_text(
         self,

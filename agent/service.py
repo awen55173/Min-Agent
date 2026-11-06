@@ -69,10 +69,14 @@ class ChatService:
         trace_logger: TraceLogger | None = None,
         tool_mode: str = "native",
         tool_timeout: float | None = None,
+        parallel_tool_calls: bool = True,
+        max_concurrency: int = 4,
     ):
         """保存依赖及循环/上下文预算参数。"""
         if tool_mode not in ("native", "text"):
             raise ValueError(f"unsupported tool_mode: {tool_mode!r} (expected 'native' or 'text')")
+        if max_concurrency < 1:
+            raise ValueError(f"max_concurrency must be >= 1, got {max_concurrency}")
         self._llm = llm
         self._manager = manager
         self._factory = registry_factory
@@ -84,6 +88,8 @@ class ChatService:
         self._trace_logger = trace_logger or TraceLogger(self._manager._root / "traces")
         self._tool_mode = tool_mode
         self._tool_timeout = tool_timeout
+        self._parallel_tool_calls = parallel_tool_calls
+        self._max_concurrency = max_concurrency
 
     def _effective_tool_mode(self) -> str:
         """确定当前会话请求的实际工具模式：显式 text 或客户端不支持原生工具时走 text。"""
@@ -251,7 +257,9 @@ class ChatService:
                 max_context_tokens=self._max_context_tokens,
                 trace_logger=self._trace_logger,
                 tool_mode=self._tool_mode,
+                parallel_tool_calls=self._parallel_tool_calls,
                 tool_timeout=self._tool_timeout,
+                max_concurrency=self._max_concurrency,
             )
             try:
                 result = agent.run(
@@ -439,7 +447,9 @@ class ChatService:
                 max_context_tokens=self._max_context_tokens,
                 trace_logger=self._trace_logger,
                 tool_mode=self._tool_mode,
+                parallel_tool_calls=self._parallel_tool_calls,
                 tool_timeout=self._tool_timeout,
+                max_concurrency=self._max_concurrency,
             )
             try:
                 result = await agent.arun(
