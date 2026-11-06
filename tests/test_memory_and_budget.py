@@ -278,6 +278,54 @@ def test_async_service_persists_and_recalls_user_memory(tmp_path):
         assert session.data.memories == {}
 
 
+@pytest.mark.parametrize("max_history_turns", [1, 6])
+def test_memory_precedes_summary_and_recent_history(max_history_turns):
+    """验证保留历史和压缩历史时，记忆均位于系统提示后、摘要前。"""
+    history = [
+        {"role": "user", "content": "安排一次旅行"},
+        {"role": "assistant", "content": "可以先确定天数"},
+        {"role": "user", "content": "安排两天"},
+        {"role": "assistant", "content": "好的"},
+    ]
+    plan = build_context(
+        "固定系统规则", history, "按刚才的要求安排",
+        existing_summary="用户目标：安排旅行", max_history_turns=max_history_turns,
+        recalled_memories={"城市": "苏州"}, session_memories={"城市": "苏州"},
+    )
+    assert plan.messages[0] == {"role": "system", "content": "固定系统规则"}
+    assert plan.messages[1]["role"] == "system"
+    assert "城市: 苏州" in plan.messages[1]["content"]
+    assert plan.messages[2] == {"role": "system", "content": plan.summary}
+    assert plan.messages[3:-1] == plan.recent_messages
+    assert plan.recent_messages[-2:] == history[-2:]
+    assert plan.messages[-1] == {"role": "user", "content": "按刚才的要求安排"}
+
+
+@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize("use_async", [False, True])
+def test_memory_is_updated_before_same_turn_recall(tmp_path, native, use_async):
+    """验证两种工具模式及同步、异步入口均在本轮请求前召回最新记忆。"""
+    manager = SessionManager(tmp_path / "data")
+    answer = "好" if native else json.dumps({"final_answer": "好"}, ensure_ascii=False)
+    llm = FakeLLM([answer, answer, answer], native=native)
+    service = ChatService(llm, manager, lambda store: build_registry(todo_store=store),
+                          tool_mode="native" if native else "text")
+    inputs = ["记住我的城市是苏州", "把我的城市改成杭州", "忘记我的城市"]
+    for index, text in enumerate(inputs):
+        if use_async:
+            result = asyncio.run(service.asend("u", "s", text, create=index == 0))
+        else:
+            result = service.send("u", "s", text, create=index == 0)
+        assert result.status == "ok"
+    assert llm.calls[0][1]["role"] == "system"
+    assert "城市: 苏州" in llm.calls[0][1]["content"]
+    assert "城市: 杭州" in llm.calls[1][1]["content"]
+    assert all("苏州" not in message["content"] for message in llm.calls[1])
+    assert not any("城市: " in message["content"] for message in llm.calls[2])
+    with manager.open("u", "s") as session:
+        assert session.data.memories == {}
+
+
 @pytest.mark.live
 def test_live_session_memory_create_update_delete_and_recall(tmp_path):
     """真实模型验收：显式添加、按字段召回、更新和删除当前会话记忆。"""
