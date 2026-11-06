@@ -23,9 +23,16 @@ uv run python cli.py -u alice --list
 uv run python cli.py -u alice -s session_id --trace
 # 根据模型容量调整每次请求的估算上下文上限（默认 16000）
 uv run python cli.py --max-context-tokens 24000 -u alice
+# 默认使用原生函数工具调用（native），也可显式指定兼容文本模式（text）
+uv run python cli.py --tool-mode text -u alice "计算 3 * 9"
 ```
 会话数据保存在 `data/{user_id}/{session_id}.json`（可用 `--data-dir` 修改），Trace 日志保存在 `data/traces/{user_id}/{session_id}.jsonl`（可用 `--trace-dir` 修改）；`-v` 打印工具调用过程。
 请在项目根目录运行（`.env` 从当前目录读取）。
+
+## 原生工具调用、异步执行与受控并行调度
+- **原生工具调用（主路径）与文本兼容模式**：注册表自动导出 OpenAI `tools` Schema，模型响应统一为 `LLMResponse(content, tool_calls)`，执行后按 `role="tool"` + `tool_call_id` 协议回填；同时保留 `--tool-mode text` 作为显式兼容选项。
+- **异步执行链**：`OpenAIClient`（`acomplete`/`achat`）、`search`、`weather`、`Agent.arun` 与 `ChatService.asend` 全链路支持异步执行，统一超时控制、取消信号传播（`CancelledError`）与指数退避重试；异步会话锁（`aopen`）与保存（`asave`）避免慢会话阻塞其他并发会话。
+- **受控并行调度**：支持单批多个工具调用（`parallel_tool_calls=True`），仅将无依赖只读工具（`weather`/`search`/`calculator`）在并发上限（`max_concurrency`）内并行执行；同一会话的待办写操作（`add`/`complete`/`delete`）及相关读写保持严格串行并立即落盘。单项超时或错误独立记录结果，不影响同批其他调用；并行乱序完成的结果按原调用顺序精准对应各自的 `api_call_id` 与内部幂等 `call_id`，且批量调用逐个计入 `max_steps` 预算。
 
 ## 会话与存储
 - 每个会话一个 JSON，保存完整历史（不含 system 提示词，供交互式回放）、结构化摘要（`summary`）、待办及下一条待办 ID、工具调用记录（`tool_calls`）、未完成轮次状态（`unfinished_turn`）、轮次计数、版本号。

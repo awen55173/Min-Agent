@@ -350,7 +350,7 @@ class Agent:
             )
         except BaseException as e:
             e.agent_result = self._interrupted(
-                finish, messages, actions, ctx, logger, trace_events, attempt, mode,
+                finish, messages, actions, records, ctx, logger, trace_events, attempt, mode,
             )  # type: ignore[attr-defined]
             raise
 
@@ -470,7 +470,7 @@ class Agent:
             )
         except BaseException as e:  # CancelledError 或 KeyboardInterrupt
             e.agent_result = await self._ainterrupted(
-                afinish, messages, actions, ctx, logger, trace_events, attempt, mode,
+                afinish, messages, actions, records, ctx, logger, trace_events, attempt, mode,
             )  # type: ignore[attr-defined]
             raise
 
@@ -478,6 +478,7 @@ class Agent:
         self,
         messages: list[Message],
         actions: list[ActionRecord],
+        records: list[dict[str, Any]],
         ctx: ToolContext,
         logger: TraceLogger | None,
         trace_events: list[dict[str, Any]],
@@ -514,6 +515,22 @@ class Agent:
                     if it.rec:
                         it.rec["status"] = "interrupted"
                         it.rec["error"] = "interrupted during tool execution"
+                    else:
+                        it.rec = _upsert_call_record(
+                            records,
+                            ToolCallRecord(
+                                call_id=it.call_id,
+                                user_id=ctx.user_id,
+                                session_id=ctx.session_id,
+                                turn_id=turn_id,
+                                step=it.step,
+                                tool=it.tool_name,
+                                args=it.args,
+                                status="interrupted",
+                                error="interrupted during tool execution",
+                                api_call_id=it.api_call_id,
+                            ).to_dict(),
+                        )
                     if not it.result_logged:
                         if logger is not None:
                             ev = logger.log_tool_result(
@@ -626,6 +643,7 @@ class Agent:
         finish,
         messages: list[Message],
         actions: list[ActionRecord],
+        records: list[dict[str, Any]],
         ctx: ToolContext,
         logger: TraceLogger | None,
         trace_events: list[dict[str, Any]],
@@ -633,7 +651,7 @@ class Agent:
         mode: str = "text",
     ) -> AgentResult:
         """同步中断收尾：补齐中断状态并返回 INTERRUPTED 结果。"""
-        self._prepare_interrupted_state(messages, actions, ctx, logger, trace_events, attempt, mode)
+        self._prepare_interrupted_state(messages, actions, records, ctx, logger, trace_events, attempt, mode)
         return finish(INTERRUPTED, f"本轮被中断。\n{_summarize(actions, '请求在执行期间被中断，未生成最终回复。')}")
 
     async def _ainterrupted(
@@ -641,6 +659,7 @@ class Agent:
         afinish,
         messages: list[Message],
         actions: list[ActionRecord],
+        records: list[dict[str, Any]],
         ctx: ToolContext,
         logger: TraceLogger | None,
         trace_events: list[dict[str, Any]],
@@ -648,7 +667,7 @@ class Agent:
         mode: str = "text",
     ) -> AgentResult:
         """异步中断/取消收尾：补齐中断状态并返回 INTERRUPTED 结果。"""
-        self._prepare_interrupted_state(messages, actions, ctx, logger, trace_events, attempt, mode)
+        self._prepare_interrupted_state(messages, actions, records, ctx, logger, trace_events, attempt, mode)
         return await afinish(INTERRUPTED, f"本轮被中断。\n{_summarize(actions, '请求在执行期间被中断，未生成最终回复。')}")
 
     def _record_parse_error(

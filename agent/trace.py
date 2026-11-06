@@ -349,6 +349,10 @@ class TraceLogger:
         """识别会话中因中断或崩溃留下的未完成工具调用。"""
         return find_unfinished_in_events(self.read_events(user_id, session_id))
 
+    def verify_integrity(self, user_id: str = "default", session_id: str = "default") -> dict[str, Any]:
+        """校验指定会话 Trace 日志的完整性并返回报告。"""
+        return verify_trace_integrity(self.read_events(user_id, session_id))
+
     def format_trace(self, user_id: str = "default", session_id: str = "default") -> str:
         """将指定会话的 Trace 事件格式化为可读文本，供 CLI 展示。"""
         events = self.read_events(user_id, session_id)
@@ -362,15 +366,17 @@ class TraceLogger:
             if kind == "turn_start":
                 lines.append(f"[turn {turn_id}] START attempt={attempt_id} user_input={ev.get('user_input')!r}")
             elif kind == "tool_request":
+                api_tag = f" api_call_id={ev.get('api_call_id')}" if ev.get("api_call_id") else ""
                 lines.append(
-                    f"[turn {turn_id}][step {ev.get('step')}] REQUEST call_id={ev.get('call_id')} "
+                    f"[turn {turn_id}][step {ev.get('step')}] REQUEST call_id={ev.get('call_id')}{api_tag} "
                     f"attempt={attempt_id} {ev.get('tool')}({ev.get('args')}) thought={ev.get('thought')!r}"
                 )
             elif kind == "tool_result":
+                api_tag = f" api_call_id={ev.get('api_call_id')}" if ev.get("api_call_id") else ""
                 reused_tag = " reused=True" if ev.get("reused") else ""
                 err_tag = f" error={ev.get('error')!r}" if ev.get("error") else ""
                 lines.append(
-                    f"[turn {turn_id}][step {ev.get('step')}] RESULT  call_id={ev.get('call_id')} "
+                    f"[turn {turn_id}][step {ev.get('step')}] RESULT  call_id={ev.get('call_id')}{api_tag} "
                     f"attempt={attempt_id} {ev.get('tool')} status={ev.get('status')} ok={ev.get('ok')} "
                     f"duration={ev.get('duration_ms')}ms{reused_tag}{err_tag} -> {ev.get('result')}"
                 )

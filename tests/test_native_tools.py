@@ -11,13 +11,14 @@ import pytest
 from agent.config import ConfigError, Settings
 from agent.context import build_context
 from agent.llm import FakeLLM, LLMError, LLMResponse, OpenAIClient, ToolCallItem, normalize_llm_response
-from agent.loop import INTERRUPTED, MAX_STEPS, OK, PARSE_EXHAUSTED, TOOL_NOT_EXECUTED, Agent
+from agent.loop import INTERRUPTED, LLM_FAILED, MAX_STEPS, OK, PARSE_EXHAUSTED, TOOL_NOT_EXECUTED, Agent
 from agent.prompt import build_native_system_prompt, build_system_prompt
 from agent.service import ChatService
 from agent.session import SessionCorruptError, SessionManager
 from agent.tools import TodoStore, build_registry
 from agent.tools.search import make_search_tool
 from agent.tools.weather import make_weather_tool
+from agent.trace import verify_trace_integrity
 import cli
 
 
@@ -789,5 +790,281 @@ def test_parallel_concurrency_limit_and_partial_timeout_preserves_other_results(
         assert "Error:" in tool_msgs["c_slow"]["content"] and "timed out" in tool_msgs["c_slow"]["content"]
 
     asyncio.run(_run())
+
+
+# ---------------------------------------------------------------------------
+# 阶段 6：完善恢复、Trace 与测试（乱序完成精准映射、逐个计入预算、写入后模型失败恢复、部分取消与重启恢复、真实 API 验收）
+# ---------------------------------------------------------------------------
+
+
+def test_out_of_order_parallel_completion_maps_accurately_and_counts_per_call_budget():
+    """并行完成顺序不同（上海最快、广州次之、北京最慢），结果仍准确对应各自调用；批量调用逐个计入 max_steps 预算。"""
+
+    async def _run():
+        """验证乱序完成的并行调用结果映射准确、Trace 校验通过，且超预算批次按剩余步数裁剪并触发 max_steps。"""
+        delays = {"Beijing": 0.08, "Shanghai": 0.01, "Guangzhou": 0.04}
+        temps = {"Beijing": "19", "Shanghai": "24", "Guangzhou": "30"}
+
+        async def out_of_order_aget(url: str) -> dict:
+            """按城市设定不同延迟使完成顺序与请求顺序相反。"""
+            for city, delay in delays.items():
+                if city in url:
+                    await asyncio.sleep(delay)
+                    t = temps[city]
+                    return {
+                        "current_condition": [
+                            {"temp_C": t, "FeelsLikeC": t, "humidity": "55", "weatherDesc": [{"value": "Clear"}]}
+                        ]
+                    }
+            raise AssertionError(f"unexpected url: {url}")
+
+        reg = build_registry(http_get=out_of_order_aget)
+        fake_llm = FakeLLM([
+            {
+                "content": "",
+                "tool_calls": [
+                    {"id": "api_bj", "name": "weather", "args": {"city": "Beijing"}},
+                    {"id": "api_sh", "name": "weather", "args": {"city": "Shanghai"}},
+                    {"id": "api_gz", "name": "weather", "args": {"city": "Guangzhou"}},
+                ],
+            },
+            "三城天气查询完毕。",
+        ])
+        res = await Agent(fake_llm, reg, tool_mode="native").arun("查北上广天气")
+        assert res.status == OK
+
+        # Trace 中 tool_result 按实际完成顺序记录（step 2 上海 -> step 3 广州 -> step 1 北京）
+        result_steps = [ev["step"] for ev in res.trace_events if ev.get("event") == "tool_result"]
+        assert result_steps == [2, 3, 1]
+
+        # 但 actions 与回填给模型的 role=tool 消息严格保持请求顺序且结果与各城市精确对应
+        assert [a.api_call_id for a in res.actions] == ["api_bj", "api_sh", "api_gz"]
+        assert '"temp_c": "19"' in res.actions[0].result
+        assert '"temp_c": "24"' in res.actions[1].result
+        assert '"temp_c": "30"' in res.actions[2].result
+
+        tool_msgs = [m for m in res.messages if m.get("role") == "tool"]
+        assert [m["tool_call_id"] for m in tool_msgs] == ["api_bj", "api_sh", "api_gz"]
+        assert '"city": "Beijing"' in tool_msgs[0]["content"]
+        assert '"city": "Shanghai"' in tool_msgs[1]["content"]
+        assert '"city": "Guangzhou"' in tool_msgs[2]["content"]
+
+        # Trace 完整性校验依然通过
+        report = verify_trace_integrity(res.trace_events)
+        assert report["valid"] is True
+
+        # 验证批量调用逐个计入工具预算：max_steps=2 时请求 3 个工具，仅执行前 2 个并返回 max_steps
+        fake_budget = FakeLLM([
+            {
+                "content": "",
+                "tool_calls": [
+                    {"id": "b1", "name": "weather", "args": {"city": "Beijing"}},
+                    {"id": "b2", "name": "weather", "args": {"city": "Shanghai"}},
+                    {"id": "b3", "name": "weather", "args": {"city": "Guangzhou"}},
+                ],
+            },
+        ])
+        res_budget = await Agent(fake_budget, reg, max_steps=2, tool_mode="native").arun("超预算批量查询")
+        assert res_budget.status == MAX_STEPS
+        assert len(res_budget.actions) == 2
+        assert [a.api_call_id for a in res_budget.actions] == ["b1", "b2"]
+        assert verify_trace_integrity(res_budget.trace_events)["valid"] is True
+
+    asyncio.run(_run())
+
+
+def test_write_succeeds_then_llm_fails_recovery_reuses_call_id_and_trace_is_valid(tmp_path: Path):
+    """核心场景：写入成功后模型失败，恢复重试时不重复写入，且 Trace 跨 attempt 关联完整有效。"""
+
+    async def _run():
+        """第 1 次尝试写待办成功但随后 LLM 报错；重启恢复后复用 turn_id 与 call_id，不重复创建待办。"""
+        session_root = tmp_path / "sessions"
+        mgr1 = SessionManager(session_root)
+        llm_fail = FakeLLM([
+            {
+                "content": "",
+                "tool_calls": [{"id": "call_add_1", "name": "todo", "args": {"action": "add", "text": "提交季度预算"}}],
+            },
+            LLMError("upstream gateway timeout"),
+        ])
+        svc1 = ChatService(llm_fail, mgr1, lambda s: build_registry(todo_store=s))
+        r1 = await svc1.asend("u1", "s_rec", "帮我记待办：提交季度预算", create=True)
+        assert r1.status == LLM_FAILED
+        assert r1.turn_id == 1
+        assert r1.attempt_id == 1
+        assert len(r1.actions) == 1 and r1.actions[0].ok is True
+
+        # 写操作已即时落盘
+        with mgr1.open("u1", "s_rec") as s:
+            assert len(s.data.todos["items"]) == 1
+            assert s.data.todos["items"][0]["text"] == "提交季度预算"
+            assert s.data.unfinished_turn is not None
+            assert s.data.unfinished_turn["turn_id"] == 1
+
+        # 模拟进程重启后使用新管理器恢复并发送“继续”
+        mgr2 = SessionManager(session_root)
+        llm_recover = FakeLLM([
+            {
+                "content": "",
+                # 模型在新一次尝试中生成了全新的 api_call_id，但内部幂等 call_id 保持稳定
+                "tool_calls": [{"id": "call_add_retry_new_id", "name": "todo", "args": {"action": "add", "text": "提交季度预算"}}],
+            },
+            "已为您恢复并确认待办 #1（提交季度预算）创建成功。",
+        ])
+        svc2 = ChatService(llm_recover, mgr2, lambda s: build_registry(todo_store=s))
+        r2 = await svc2.asend("u1", "s_rec", "继续")
+        assert r2.status == OK
+        assert r2.turn_id == 1
+        assert r2.attempt_id == 2
+        assert len(r2.actions) == 1
+        assert r2.actions[0].reused is True
+        assert r2.actions[0].api_call_id == "call_add_retry_new_id"
+        assert r2.actions[0].call_id == r1.actions[0].call_id
+
+        with mgr2.open("u1", "s_rec") as s:
+            assert len(s.data.todos["items"]) == 1  # 绝不重复创建
+            assert s.data.unfinished_turn is None
+
+        report = svc2.trace_logger.verify_integrity("u1", "s_rec")
+        assert report["valid"] is True
+        assert report["unfinished_calls"] == []
+
+    asyncio.run(_run())
+
+
+def test_mid_batch_cancellation_and_restart_recovery(tmp_path: Path):
+    """批量调用中部分完成、部分被取消（CancelledError）：已完成写操作落盘保留，未完成调用记为 interrupted，重启恢复后可继续完成。"""
+
+    async def _run():
+        """批次含 [todo.add, weather(SlowCity)]，在 weather 执行期间取消任务，随后重启恢复。"""
+        session_root = tmp_path / "sessions"
+        mgr1 = SessionManager(session_root)
+        weather_started = asyncio.Event()
+
+        async def cancellable_aget(url: str) -> dict:
+            """首次调用时通知已进入并挂起等待取消。"""
+            weather_started.set()
+            await asyncio.sleep(5.0)
+            return {}
+
+        llm1 = FakeLLM([
+            {
+                "content": "",
+                "tool_calls": [
+                    {"id": "b_todo", "name": "todo", "args": {"action": "add", "text": "买高铁票"}},
+                    {"id": "b_wea", "name": "weather", "args": {"city": "Beijing"}},
+                ],
+            },
+            "不会到达这里",
+        ])
+        svc1 = ChatService(llm1, mgr1, lambda s: build_registry(todo_store=s, http_get=cancellable_aget))
+        task = asyncio.create_task(svc1.asend("u1", "s_cancel", "记买高铁票并查北京天气", create=True))
+        await asyncio.wait_for(weather_started.wait(), timeout=2.0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        # 验证取消后：todo.add 已持久化，weather 被记录为 interrupted，Trace 完整且能识别未完成调用
+        with mgr1.open("u1", "s_cancel") as s:
+            assert len(s.data.todos["items"]) == 1
+            assert s.data.todos["items"][0]["text"] == "买高铁票"
+            assert s.data.unfinished_turn is not None
+            assert s.data.unfinished_turn["status"] == INTERRUPTED
+            tool_msgs = [m for m in s.data.history if m.get("role") == "tool"]
+            assert len(tool_msgs) == 2
+            assert tool_msgs[0]["tool_call_id"] == "b_todo" and '"id": 1' in tool_msgs[0]["content"]
+            assert tool_msgs[1]["tool_call_id"] == "b_wea" and "status=interrupted" in tool_msgs[1]["content"]
+
+        unfinished = svc1.trace_logger.find_unfinished_calls("u1", "s_cancel")
+        assert len(unfinished) == 1
+        assert unfinished[0]["tool"] == "weather"
+        assert svc1.trace_logger.verify_integrity("u1", "s_cancel")["valid"] is True
+
+        # 重启恢复：todo.add 走幂等复用（不重复写入），weather 重新执行成功
+        async def fast_aget(url: str) -> dict:
+            """恢复后正常返回北京天气。"""
+            return {
+                "current_condition": [
+                    {"temp_C": "23", "FeelsLikeC": "22", "humidity": "40", "weatherDesc": [{"value": "Sunny"}]}
+                ]
+            }
+
+        mgr2 = SessionManager(session_root)
+        llm2 = FakeLLM([
+            {
+                "content": "",
+                "tool_calls": [
+                    {"id": "b_todo_2", "name": "todo", "args": {"action": "add", "text": "买高铁票"}},
+                    {"id": "b_wea_2", "name": "weather", "args": {"city": "Beijing"}},
+                ],
+            },
+            "已恢复：待办 #1（买高铁票）已存在，北京今天晴 23°C。",
+        ])
+        svc2 = ChatService(llm2, mgr2, lambda s: build_registry(todo_store=s, http_get=fast_aget))
+        r2 = await svc2.asend("u1", "s_cancel", "继续")
+        assert r2.status == OK
+        assert r2.attempt_id == 2
+        assert r2.actions[0].tool == "todo" and r2.actions[0].reused is True
+        assert r2.actions[1].tool == "weather" and r2.actions[1].ok is True
+
+        with mgr2.open("u1", "s_cancel") as s:
+            assert len(s.data.todos["items"]) == 1  # 仍只有 1 条待办
+            assert s.data.unfinished_turn is None
+
+        report2 = svc2.trace_logger.verify_integrity("u1", "s_cancel")
+        assert report2["valid"] is True
+        assert report2["unfinished_calls"] == []
+
+    asyncio.run(_run())
+
+
+@pytest.mark.live
+def test_live_parallel_weather_and_serial_dependent_todo(tmp_path: Path):
+    """真实 API 核心流程验收：1) 同时查询北京、上海天气；2) 查北京天气再把结果记成待办。"""
+
+    async def _run():
+        """使用真实模型与 ChatService.asend 验证并发只读与串行依赖闭环（外部 wttr.in 抖动时注入稳定天气源以验证真实模型调度）。"""
+        try:
+            settings = Settings.from_env()
+        except ConfigError as e:
+            pytest.skip(f"LLM env not configured: {e}")
+
+        async def reliable_weather_aget(url: str) -> dict:
+            """为真实 LLM 调用提供稳定的异步天气响应并保留 0.1s I/O 延迟以检验并发。"""
+            await asyncio.sleep(0.10)
+            temp = "21" if "Beijing" in url else "26"
+            return {
+                "current_condition": [
+                    {"temp_C": temp, "FeelsLikeC": temp, "humidity": "50", "weatherDesc": [{"value": "Sunny"}]}
+                ]
+            }
+
+        client = OpenAIClient(settings)
+        mgr = SessionManager(tmp_path / "sessions")
+        svc = ChatService(client, mgr, lambda s: build_registry(todo_store=s, http_get=reliable_weather_aget))
+
+        # 场景 1：同时查询北京、上海天气
+        r1 = await svc.asend("live_u", "live_parallel", "请同时查询北京和上海现在的天气", create=True)
+        assert r1.status == OK
+        weather_calls = [a for a in r1.actions if a.tool == "weather" and a.ok]
+        assert len(weather_calls) >= 2
+        assert "21" in r1.answer and "26" in r1.answer
+
+        # 场景 2：查北京天气，再把结果记成待办
+        r2 = await svc.asend(
+            "live_u",
+            "live_dep",
+            "请先查询北京的天气，然后再把北京的天气结果添加为一条待办事项",
+            create=True,
+        )
+        assert r2.status == OK
+        tools_used = [a.tool for a in r2.actions if a.ok]
+        assert "weather" in tools_used and "todo" in tools_used
+        with mgr.open("live_u", "live_dep") as s:
+            assert len(s.data.todos["items"]) >= 1
+        assert svc.trace_logger.verify_integrity("live_u", "live_dep")["valid"] is True
+
+    asyncio.run(_run())
+
 
 

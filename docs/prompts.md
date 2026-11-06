@@ -29,3 +29,4 @@
     - 小阶段 3（适配会话与上下文）：扩展消息结构与 `SessionData` 校验支持 `assistant.tool_calls` 与 `role="tool"`，在 `context.py` 与 `cli.py` 中适配历史回放、思考剥离与结构化摘要压缩，完整保留工具请求与结果的关联（`tool_call_id`），区分模型 `api_call_id` 与内部幂等 `call_id`，并无缝兼容旧会话数据。
     - 小阶段 4（改造异步执行链）：将模型请求（`acomplete`/`achat`）、搜索（`search`）、天气（`weather`）及主循环（`Agent.arun`）、对话服务（`ChatService.asend`）改造为异步调用；统一超时、取消传播（`CancelledError`）与退避重试；改造会话锁（`aopen`）与保存（`asave`）为非阻塞异步操作，避免阻塞其他并发会话。
     - 小阶段 5（增加受控并行调度）：支持单次响应返回多个 `tool_calls`（`parallel_tool_calls=True`），通过受控分段（`_partition_batch_segments`）与 `asyncio.Semaphore(max_concurrency)` 仅并发执行无依赖只读工具（`weather`/`search`/`calculator`），同一会话的待办写操作（`add`/`complete`/`delete`）及同批相关读写（`todo.list`）保持严格串行并立即落盘；单项超时或错误独立记录结果，不中断同批其他调用。
+    - 小阶段 6（完善恢复、Trace 与测试）：并行乱序完成的工具结果按请求顺序精准绑定各自的模型 `api_call_id` 与内部幂等 `call_id`，批量调用逐个计入 `max_steps` 预算；复用 M5 写操作即时落盘、跨尝试稳定的 `call_id` 幂等恢复与 `attempt_id` Trace 校验，补齐部分失败、中途取消（`CancelledError`）、重启恢复及真实 API 并发/串行验收测试。
