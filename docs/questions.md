@@ -46,6 +46,7 @@
 | 失败后的新请求（如用户明确要求“另外再创建一条同名待办”）被误判为旧请求重试，导致被去重 | 只要存在 `unfinished_turn`，下一次输入就无条件复用旧 `turn_id`，未区分恢复重试与新建请求 | 新增 `_is_retry_request`（及可选 `retry` 参数）：仅当输入与原未完成请求相同或包含继续/重试意图且不含“另外/再创建/新增一条”等新建意图时才复用原 `turn_id`，否则作为新请求分配新 `turn_id` |
 | 写操作即时保存成功后，若整轮结束时最终保存失败，`OSError` 直接抛出且 Trace 已提前记录 `turn_end=ok` | `Agent.run` 在 `finish()` 中先写 `turn_end` 日志，返回后 `ChatService.send` 才执行最终 `session.save()` 且未捕获 `OSError` | 新增 `on_turn_end` 钩子并在 `finish()` 记录 `turn_end` 前执行最终落盘；若落盘失败则回滚未落盘内存变更、统一转为 `persist_error` 状态并写入 `turn_end(status="persist_error")`，保留此前已即时保存的操作 |
 | 正常恢复重试后，Trace 完整性检查返回 `valid=False` | 重试复用了同一个 `turn_id`，但新一次尝试的工具步数重新从 1 开始（如 `[1, 1]`），而原校验按 `turn_id` 汇总所有步数 | 为 Trace 事件增加 `attempt_id` 区分同一 `turn_id` 下的每次尝试，保持 `call_id` 跨尝试稳定用于幂等，并在 `verify_trace_integrity` 中按 `(turn_id, attempt_id)` 校验请求/结果配对、步数从 1 连续递增与终止事件 |
+| 原生工具调用响应中 `message.content` 可能为 `None`，原 `_extract` 会判定为空响应并抛 `LLMError` | 模型返回 `tool_calls` 时通常不填充文本 `content` | 新增 `LLMResponse(content, tool_calls)` 与 `_extract_response`，允许仅含 `tool_calls` 或仅含非空 `content` 的响应通过，仅当二者同时为空时抛 `LLMError`；并对不支持 `parallel_tool_calls` 参数的兼容服务端自动降级重试 |
 
 ## 2026-11-05 评审修复验收
 

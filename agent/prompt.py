@@ -1,11 +1,11 @@
-"""提示词构建：输出格式要求 + 注册表导出的工具 Schema。"""
+"""提示词构建：支持原生函数工具调用（主路径）与显式文本 JSON 模式（兼容路径）。"""
 from __future__ import annotations
 
 import json
 
 from .tools.registry import ToolRegistry
 
-_TEMPLATE = """You are a helpful assistant that can use tools to complete the user's request.
+_TEXT_TEMPLATE = """You are a helpful assistant that can use tools to complete the user's request.
 
 # Available tools
 Each tool has a name, a description and a JSON Schema for its arguments:
@@ -32,8 +32,27 @@ Reply with exactly ONE JSON object and nothing else. Choose one of:
 - Answer directly with final_answer when no tool is needed.
 - Write final_answer in the same language as the user."""
 
+_NATIVE_TEMPLATE = """You are a helpful assistant that can use function calling tools to complete the user's request.
 
-def build_system_prompt(registry: ToolRegistry) -> str:
-    """根据注册表中的工具 schema 生成系统提示词。"""
+# Rules
+- Use the provided tools whenever external calculation, web search, weather lookup, or todo management is needed.
+- Supply tool arguments that strictly match the tool's JSON Schema.
+- Never invent or fabricate tool results; always wait for the tool execution result before claiming an action succeeded.
+- If a tool result is truncated, narrow the query or read in batches; do not assume omitted content.
+- If a tool returns an error, fix the arguments and retry, or explain the problem to the user.
+- To complete or delete a todo item, always use the integer id returned by the todo tool (call todo with action='list' first if unknown).
+- When no tool is needed or all required tool calls are finished, reply directly to the user in the same language as the user."""
+
+
+def build_system_prompt(registry: ToolRegistry, tool_mode: str = "text") -> str:
+    """根据工具调用模式生成系统提示词：native 模式使用原生函数调用规则，text 模式内嵌 JSON 协议与工具 Schema。"""
+    if tool_mode == "native":
+        return build_native_system_prompt(registry)
     tools = json.dumps(registry.schemas(), ensure_ascii=False, indent=2)
-    return _TEMPLATE.format(tools=tools)
+    return _TEXT_TEMPLATE.format(tools=tools)
+
+
+def build_native_system_prompt(registry: ToolRegistry) -> str:
+    """生成原生工具调用（function calling）模式下的系统提示词。"""
+    _ = registry
+    return _NATIVE_TEMPLATE

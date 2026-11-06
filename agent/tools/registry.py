@@ -56,6 +56,17 @@ class Tool:
         """返回注入 prompt 的工具描述。"""
         return {"name": self.name, "description": self.description, "parameters": self.parameters}
 
+    def openai_schema(self) -> dict[str, Any]:
+        """返回 OpenAI Chat Completions tools 参数所需的函数工具定义。"""
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": self.parameters,
+            },
+        }
+
 
 def validate_args(schema: dict[str, Any], args: Any) -> None:
     """按简化 JSON Schema 校验参数（必填、类型、枚举、未知字段），失败抛 ToolError。"""
@@ -123,6 +134,10 @@ class ToolRegistry:
     def schemas(self) -> list[dict[str, Any]]:
         """返回所有工具的 schema 列表。"""
         return [t.schema() for t in self._tools.values()]
+
+    def openai_tools(self) -> list[dict[str, Any]]:
+        """导出所有已注册工具的 OpenAI 函数调用 Schema 列表。"""
+        return [t.openai_schema() for t in self._tools.values()]
 
     def execute(self, name: str, args: Any, ctx: ToolContext | None = None) -> ToolResult:
         """校验并执行工具；校验、执行、结果序列化的任何失败都转为 ok=False，不向外抛异常。"""
