@@ -25,3 +25,4 @@
 ## 2026-11-06
 18. 分阶段实施原生工具调用、异步执行链与受控并行调度：
     - 小阶段 1（接入原生工具调用）：验证当前模型与服务的原生 function calling 支持情况，注册表导出 OpenAI `tools` Schema，将模型响应统一为“文本回答 + 工具调用列表”（`LLMResponse` / `ToolCallItem`），原生模式作为主路径并保留文本模式兼容选项。
+    - 小阶段 2（先跑通串行闭环）：限制单次返回一个原生工具调用（`parallel_tool_calls=False`），解析工具名、JSON 参数与模型 `api_call_id`，执行后按 `role="tool"` + `tool_call_id` 协议回填，保留参数校验、步数限制与异常处理，不再依赖自定义 `action` JSON。

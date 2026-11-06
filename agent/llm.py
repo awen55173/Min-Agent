@@ -87,6 +87,8 @@ class LLMClient(Protocol):
 class OpenAIClient:
     """调用兼容 OpenAI 的接口，支持自定义服务地址与原生函数工具调用。"""
 
+    supports_native_tools: bool = True
+
     def __init__(self, settings: Settings, temperature: float = 0.1, backoff: float = 1.0):
         """按配置创建客户端，并保存模型参数和重试策略。"""
         self._model = settings.model
@@ -192,11 +194,15 @@ class OpenAIClient:
 class FakeLLM:
     """按顺序返回预设回复（支持纯文本或带 tool_calls 的 LLMResponse/字典），并记录收到的消息。"""
 
-    def __init__(self, replies: list[ Any]):
-        """复制预设回复，并初始化调用记录。"""
+    def __init__(self, replies: list[Any], native: bool | None = None):
+        """复制预设回复，并初始化调用记录；native=True 或回复含结构化响应时启用原生工具模式。"""
         self._replies = list(replies)
         self.calls: list[list[Message]] = []
         self.tools_passed: list[list[dict[str, Any]] | None] = []
+        if native is not None:
+            self.supports_native_tools = bool(native)
+        else:
+            self.supports_native_tools = any(isinstance(r, (LLMResponse, dict)) for r in self._replies)
 
     def complete(
         self,

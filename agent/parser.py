@@ -123,3 +123,35 @@ def parse_output(text: str, registry: ToolRegistry) -> ParsedOutput:
     except ToolError as e:
         raise ParseError(f"invalid action_input for tool '{name}': {e}") from None
     return ParsedOutput("action", thought, action=name, action_input=args)
+
+
+def parse_tool_call_args(name: str, raw_arguments: Any, registry: ToolRegistry) -> dict[str, Any]:
+    """解析并校验原生工具调用的工具名与 JSON 参数，不合法时统一抛 ParseError。"""
+    if not isinstance(name, str) or not name.strip():
+        raise ParseError("tool call 'name' must be a non-empty string")
+    tool = registry.get(name)
+    if tool is None:
+        raise ParseError(f"unknown tool '{name}'. available tools: {', '.join(registry.names())}")
+    if isinstance(raw_arguments, dict):
+        args = raw_arguments
+    elif isinstance(raw_arguments, str):
+        raw_str = raw_arguments.strip()
+        if not raw_str:
+            args = {}
+        else:
+            try:
+                args = json.loads(raw_str)
+            except RecursionError:
+                raise ParseError(f"arguments JSON nesting is too deep for tool '{name}'") from None
+            except ValueError as e:
+                raise ParseError(f"invalid JSON arguments for tool '{name}': {e}") from None
+    else:
+        raise ParseError(f"arguments for tool '{name}' must be a JSON object")
+    if not isinstance(args, dict):
+        raise ParseError(f"arguments for tool '{name}' must be a JSON object")
+    _check_depth(args)
+    try:
+        validate_args(tool.parameters, args)
+    except ToolError as e:
+        raise ParseError(f"invalid arguments for tool '{name}': {e}") from None
+    return args

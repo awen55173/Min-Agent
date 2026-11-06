@@ -55,7 +55,7 @@ def make_call_id(
 
 @dataclass
 class ToolCallRecord:
-    """持久化的单次工具调用记录：关联用户、会话、轮次、call_id、参数、执行状态与结果。"""
+    """持久化的单次工具调用记录：关联用户、会话、轮次、内部幂等 call_id、模型 api_call_id、参数、状态与结果。"""
 
     call_id: str
     user_id: str
@@ -69,11 +69,13 @@ class ToolCallRecord:
     error: str | None = None
     duration_ms: float = 0.0
     timestamp: str = field(default_factory=_now)
+    api_call_id: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         """转为可持久化为 JSON 的字典。"""
         return {
             "call_id": self.call_id,
+            "api_call_id": self.api_call_id,
             "user_id": self.user_id,
             "session_id": self.session_id,
             "turn_id": self.turn_id,
@@ -219,6 +221,7 @@ class TraceLogger:
         tool: str,
         args: dict[str, Any],
         attempt_id: int | str = 1,
+        api_call_id: str = "",
     ) -> dict[str, Any]:
         """在工具执行前记录工具调用请求事件。"""
         ev = {
@@ -229,6 +232,7 @@ class TraceLogger:
             "attempt_id": attempt_id,
             "step": step,
             "call_id": call_id,
+            "api_call_id": api_call_id,
             "thought": thought,
             "tool": tool,
             "args": args,
@@ -254,6 +258,7 @@ class TraceLogger:
         error: str | None = None,
         reused: bool = False,
         attempt_id: int | str = 1,
+        api_call_id: str = "",
     ) -> dict[str, Any]:
         """在工具执行后（或复用/中断时）记录工具结果事件，与同次尝试的 tool_request 成对。"""
         ev = {
@@ -264,6 +269,7 @@ class TraceLogger:
             "attempt_id": attempt_id,
             "step": step,
             "call_id": call_id,
+            "api_call_id": api_call_id,
             "thought": thought,
             "tool": tool,
             "args": args,
