@@ -108,6 +108,7 @@ class ChatService:
         """
         with self._manager.open(user_id, session_id, create=create) as session:
             data = session.data
+            # 检查上轮任务是否执行完成，若未完成则在历史中追加中断提示，避免用户误以为上轮已完成。
             if data.history:
                 data.history = _ensure_tool_Pairs(data.history)
                 if data.history[-1].get("role") in ("user", "tool"):
