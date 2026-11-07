@@ -51,7 +51,7 @@ TAVILY_API_KEY=
 
 ## 启动与会话
 
-一次性提问会创建新 session，并在标准错误输出 session ID：
+一次性提问会创建新 session，并输出 session ID：
 
 ```powershell
 uv run python cli.py -u alice "查一下北京天气并记一条待办"
@@ -189,6 +189,3 @@ uv run pytest -q -m live
 
 确定性测试使用 FakeLLM 与注入的工具响应，覆盖工具 CRUD、并行/串行调度、session 隔离与恢复、上下文限制、故障恢复和记忆新增/更新/删除。完整 live 集需要模型服务支持原生工具调用、可访问 wttr.in，并配置 Tavily key 以执行搜索测试；并行天气调度场景使用稳定的注入响应以避免公共天气接口抖动。真实 API 验收结果和限制见 `docs/questions.md`。
 
-## 当前范围与后续方向
-
-已实现单进程 Agent Runtime、同步/异步模型与工具调用、受控并行、session 文件锁和原子保存、上下文估算与结构化压缩、显式会话记忆、失败恢复与 Trace。尚未实现跨 session 或长期语义记忆、LLM 自动提取候选事实、后台任务队列/完成通知、LLM 摘要和多模态输入。
