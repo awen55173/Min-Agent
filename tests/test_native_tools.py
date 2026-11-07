@@ -11,8 +11,8 @@ import pytest
 from agent.config import ConfigError, Settings
 from agent.context import build_context
 from agent.llm import FakeLLM, LLMError, LLMResponse, OpenAIClient, ToolCallItem, normalize_llm_response
-from agent.loop import INTERRUPTED, LLM_FAILED, MAX_STEPS, OK, PARSE_EXHAUSTED, TOOL_NOT_EXECUTED, Agent
-from agent.prompt import build_native_system_prompt, build_system_prompt
+from agent.loop import INTERRUPTED, LLM_FAILED, MAX_STEPS, OK, OUTPUT_EXHAUSTED, TOOL_NOT_EXECUTED, Agent
+from agent.prompt import build_system_prompt
 from agent.service import ChatService
 from agent.session import SessionCorruptError, SessionManager
 from agent.tools import TodoStore, build_registry
@@ -80,26 +80,23 @@ def test_openai_client_extract_response_unifies_text_and_tool_calls(monkeypatch:
     assert len(captured_kwargs["tools"]) == 4
 
 
-def test_openai_client_complete_rejects_empty_text_and_no_tool_calls(monkeypatch: pytest.MonkeyPatch):
-    """当响应既无有效文本也无 tool_calls 时，complete 抛出 LLMError。"""
+def test_openai_client_returns_empty_text_for_runtime_correction(monkeypatch: pytest.MonkeyPatch):
+    """空原生响应交由运行时回答校验和重试处理。"""
     settings = Settings(api_key="sk-test", model="test-model", base_url="https://example.com/v1")
     client = OpenAIClient(settings)
     empty_resp = types.SimpleNamespace(
         choices=[types.SimpleNamespace(message=types.SimpleNamespace(content="   ", tool_calls=None))]
     )
     monkeypatch.setattr(client._client.chat.completions, "create", lambda **_: empty_resp)
-    with pytest.raises(LLMError, match="empty content and no tool_calls"):
-        client.complete([{"role": "user", "content": "hi"}])
+    assert client.complete([{"role": "user", "content": "hi"}]).content == "   "
 
 
-def test_fake_llm_and_prompt_modes():
-    """FakeLLM.complete 支持返回结构化工具调用与文本回复；prompt 区分 native 与 text 模式。"""
+def test_fake_llm_and_native_prompt():
+    """模拟客户端返回原生调用或直接文本，提示词不包含自定义 JSON 输出协议。"""
     reg = build_registry()
-    native_p = build_system_prompt(reg, tool_mode="native")
-    text_p = build_system_prompt(reg, tool_mode="text")
-    assert native_p == build_native_system_prompt(reg)
+    native_p = build_system_prompt(reg)
     assert '"action_input"' not in native_p
-    assert '"action_input"' in text_p
+    assert "Reply with exactly ONE JSON object" not in native_p
 
     fake = FakeLLM([
         {"content": "先查天气", "tool_calls": [{"id": "c1", "name": "weather", "args": {"city": "Beijing"}}]},
@@ -128,7 +125,7 @@ def test_live_model_supports_native_tool_calling():
     reg = build_registry()
     resp = client.complete(
         [
-            {"role": "system", "content": build_native_system_prompt(reg)},
+            {"role": "system", "content": build_system_prompt(reg)},
             {"role": "user", "content": "请调用 calculator 工具计算 123 * 456"},
         ],
         tools=reg.openai_tools(),
@@ -167,7 +164,7 @@ def test_native_serial_loop_executes_tools_and_backfills_tool_role_messages():
         },
         "北京今天晴（22°C），已为您添加待办 #1。",
     ])
-    agent = Agent(fake, reg, tool_mode="native")
+    agent = Agent(fake, reg)
     res = agent.run("查北京天气并记成待办", user_id="u1", session_id="s1", turn_id=1)
 
     assert res.status == OK
@@ -205,7 +202,7 @@ def test_native_serial_loop_parameter_validation_and_retry():
         },
         "已添加买咖啡待办。",
     ])
-    res = Agent(fake_recover, reg, tool_mode="native").run("记买咖啡")
+    res = Agent(fake_recover, reg).run("记买咖啡")
     assert res.status == OK
     assert len(res.actions) == 1
     assert res.actions[0].api_call_id == "ok_1"
@@ -218,12 +215,12 @@ def test_native_serial_loop_parameter_validation_and_retry():
         },
         "我已经帮你执行好了！",
     ])
-    res_unexec = Agent(fake_unexec, reg, tool_mode="native").run("执行未知工具")
+    res_unexec = Agent(fake_unexec, reg, max_output_retries=1).run("执行未知工具")
     assert res_unexec.status == TOOL_NOT_EXECUTED
 
 
-def test_native_serial_loop_rejects_multiple_calls_when_parallel_disabled_and_enforces_max_steps():
-    """串行闭环下若模型一次返回多个工具调用，回填错误要求逐个调用；超出 max_steps 返回 max_steps。"""
+def test_native_serial_loop_schedules_multiple_calls_serially_and_enforces_max_steps():
+    """关闭并行时仍接受原生多工具请求并串行执行，超出工具步数时返回失败。"""
     reg = build_registry()
     fake_multi = FakeLLM([
         {
@@ -239,38 +236,21 @@ def test_native_serial_loop_rejects_multiple_calls_when_parallel_disabled_and_en
         },
         "答案是 2",
     ])
-    res = Agent(fake_multi, reg, tool_mode="native", parallel_tool_calls=False).run("算一下")
+    res = Agent(fake_multi, reg, parallel_tool_calls=False).run("算一下")
     assert res.status == OK
-    assert len(res.actions) == 1
-    assert res.actions[0].api_call_id == "c1_retry"
+    assert [a.api_call_id for a in res.actions] == ["c1", "c2", "c1_retry"]
 
     fake_steps = FakeLLM([
         {"content": "", "tool_calls": [{"id": "s1", "name": "calculator", "args": {"expression": "1+1"}}]},
         {"content": "", "tool_calls": [{"id": "s2", "name": "calculator", "args": {"expression": "2+2"}}]},
     ])
-    res_max = Agent(fake_steps, reg, max_steps=1, tool_mode="native").run("算两步")
+    res_max = Agent(fake_steps, reg, max_steps=1).run("算两步")
     assert res_max.status == MAX_STEPS
     assert len(res_max.actions) == 1
 
-    fake_exhaust = FakeLLM(["   ", "   "], native=True)
-    res_ex = Agent(fake_exhaust, reg, max_parse_retries=1, tool_mode="native").run("空回复")
-    assert res_ex.status == PARSE_EXHAUSTED
-
-
-def test_explicit_text_mode_compatibility_option():
-    """显式传入 tool_mode='text' 时仍按旧版 JSON 协议运行。"""
-    reg = build_registry()
-    fake = FakeLLM(
-        [
-            '{"thought": "calc", "action": "calculator", "action_input": {"expression": "3 * 9"}}',
-            '{"thought": "done", "final_answer": "结果是 27"}',
-        ],
-        native=True,  # 即便客户端支持 native，显式指定 tool_mode='text' 也强制走文本模式
-    )
-    res = Agent(fake, reg, tool_mode="text").run("3*9")
-    assert res.status == OK
-    assert res.answer == "结果是 27"
-    assert res.actions[0].api_call_id == ""
+    fake_exhaust = FakeLLM(["   ", "   "])
+    res_ex = Agent(fake_exhaust, reg, max_output_retries=1).run("空回复")
+    assert res_ex.status == OUTPUT_EXHAUSTED
 
 
 @pytest.mark.live
@@ -283,7 +263,7 @@ def test_live_native_serial_closed_loop():
     client = OpenAIClient(settings)
     store = TodoStore()
     reg = build_registry(todo_store=store)
-    agent = Agent(client, reg, tool_mode="native", parallel_tool_calls=False)
+    agent = Agent(client, reg, parallel_tool_calls=False)
     res = agent.run("请先用 calculator 计算 15 * 16，然后把计算结果添加为一条待办（如：核对数据 240）")
     assert res.status == OK
     assert any(a.tool == "calculator" and a.ok and a.api_call_id for a in res.actions)
@@ -406,33 +386,6 @@ def test_native_context_compression_strips_thought_keeps_pairs_and_completes_tod
             assert sent_msgs[idx + 1]["tool_call_id"] == tc_id
 
 
-def test_legacy_session_seamlessly_resumes_in_native_mode(tmp_path: Path):
-    """兼容旧会话数据：由旧版文本 JSON 模式持久化的会话，切换到原生工具调用模式后可无缝恢复并继续对话。"""
-    mgr = SessionManager(tmp_path / "sessions")
-    legacy_llm = FakeLLM([
-        '{"thought": "t", "action": "todo", "action_input": {"action": "add", "text": "旧会话待办"}}',
-        '{"thought": "d", "final_answer": "旧会话已添加 #1"}',
-    ])
-    svc_legacy = ChatService(legacy_llm, mgr, lambda s: build_registry(todo_store=s), tool_mode="text")
-    r_old = svc_legacy.send("u1", "legacy_s", "添加旧会话待办", create=True)
-    assert r_old.status == OK
-
-    # 使用原生模式的客户端恢复同一会话
-    native_llm = FakeLLM([
-        {
-            "content": "",
-            "tool_calls": [{"id": "call_native_complete", "name": "todo", "args": {"action": "complete", "id": 1}}],
-        },
-        "已在原生模式下完成旧会话的待办 #1。",
-    ])
-    svc_native = ChatService(native_llm, mgr, lambda s: build_registry(todo_store=s), tool_mode="native")
-    r_new = svc_native.send("u1", "legacy_s", "完成第一条待办")
-    assert r_new.status == OK
-    with mgr.open("u1", "legacy_s") as s:
-        assert s.data.todos["items"][0]["done"] is True
-        assert any(m.get("role") == "tool" for m in s.data.history)
-
-
 # ---------------------------------------------------------------------------
 # 阶段 4：改造异步执行链（异步 LLM、搜索/天气、Agent.arun、超时/取消/重试、非阻塞会话锁与 asend）
 # ---------------------------------------------------------------------------
@@ -527,7 +480,7 @@ def test_async_search_weather_and_agent_arun_with_tool_timeout():
             {"content": "", "tool_calls": [{"id": "tc_w2", "name": "weather", "args": {"city": "SlowCity"}}]},
             "搜索与北京天气成功，SlowCity 查询超时。",
         ])
-        agent = Agent(fake_llm, reg, tool_mode="native", tool_timeout=0.06)
+        agent = Agent(fake_llm, reg, tool_timeout=0.06)
         res = await agent.arun("测试异步工具链")
         assert res.status == OK
         assert len(res.actions) == 3
@@ -647,7 +600,7 @@ def test_parallel_weather_queries_execute_concurrently():
             },
             "北京 25°C，上海 28°C。",
         ])
-        agent = Agent(fake_llm, reg, tool_mode="native", parallel_tool_calls=True)
+        agent = Agent(fake_llm, reg, parallel_tool_calls=True)
         t0 = time.monotonic()
         res = await agent.arun("同时查询北京、上海天气")
         elapsed = time.monotonic() - t0
@@ -767,7 +720,7 @@ def test_parallel_concurrency_limit_and_partial_timeout_preserves_other_results(
         agent = Agent(
             fake_llm,
             reg,
-            tool_mode="native",
+
             parallel_tool_calls=True,
             tool_timeout=0.07,
             max_concurrency=2,
@@ -830,7 +783,7 @@ def test_out_of_order_parallel_completion_maps_accurately_and_counts_per_call_bu
             },
             "三城天气查询完毕。",
         ])
-        res = await Agent(fake_llm, reg, tool_mode="native").arun("查北上广天气")
+        res = await Agent(fake_llm, reg).arun("查北上广天气")
         assert res.status == OK
 
         # Trace 中 tool_result 按实际完成顺序记录（step 2 上海 -> step 3 广州 -> step 1 北京）
@@ -864,7 +817,7 @@ def test_out_of_order_parallel_completion_maps_accurately_and_counts_per_call_bu
                 ],
             },
         ])
-        res_budget = await Agent(fake_budget, reg, max_steps=2, tool_mode="native").arun("超预算批量查询")
+        res_budget = await Agent(fake_budget, reg, max_steps=2).arun("超预算批量查询")
         assert res_budget.status == MAX_STEPS
         assert len(res_budget.actions) == 2
         assert [a.api_call_id for a in res_budget.actions] == ["b1", "b2"]
@@ -1065,6 +1018,5 @@ def test_live_parallel_weather_and_serial_dependent_todo(tmp_path: Path):
         assert svc.trace_logger.verify_integrity("live_u", "live_dep")["valid"] is True
 
     asyncio.run(_run())
-
 
 

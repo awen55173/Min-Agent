@@ -90,3 +90,13 @@
 - 问题与原因：README 仅简述按需召回和放置位置，缺少提取、更新、选择、注入及保存的时序，容易混淆用户记忆、历史摘要和待办状态。
 - 解决方案：新增独立 Memory 章节，说明首次模型请求前召回、同轮更新立即可用、系统提示后摘要前的消息位置、字段与指代触发示例、无记忆提示、800 估算 token 注入上限、会话隔离和持久化，以及正则提取和删除操作的实际边界。
 - 验证：新增压缩/非压缩上下文位置测试，以及 native/text、同步/异步入口的同轮新增更新删除测试；README 纳入 UTF-8 检查。针对性测试 30 passed、1 skipped；全量常规测试 `.venv/Scripts/python.exe -m pytest -q` 为 318 passed、12 skipped。本次未重新运行真实 API 测试；未修改记忆运行逻辑。
+
+## 2026-11-07 原生工具调用与循环解耦
+
+- 问题与原因：旧运行时同时维护文本/原生、同步/异步四套循环；提示词要求模型生成自定义 JSON，解析器、历史处理和 CLI 也依赖该协议，职责重复且难以单独调整。
+- 解决方案：删除文本 JSON 模板、`parser.py` 和模式切换，只接受原生模型接口。`loop.py` 按 `may_think → think → disputed / perform → observe → accept` 拆分；每轮状态独立，同步入口复用异步循环。`execution.py` 管理并行组、串行写入、观察、幂等和中断；`tool_call.py` 仅校验原生参数；`runtime.py` 定义结果与预算异常。
+- 校验边界：回答正文不解码、不强制 JSON，JSON/代码块原样显示和保存。保留非空回答、原生工具名称/参数/ID、工具返回值序列化与截断检查。非法调用后声称完成会反馈并消耗累计重试次数；耗尽进入 3.6 失败收尾。`observe` 与 `accept` 等待保存完成，因此为异步方法。
+- 兼容变化：删除 `--tool-mode` / `tool_mode`，`max_parse_retries` 改为 `max_output_retries`，纠错状态和事件分别为 `output_retries_exhausted` / `validation_error`。关闭并行只改变执行顺序，不拒绝合法的原生多调用响应。早期文本协议历史保留原文，不再自动解码；原生会话继续支持恢复。
+- 测试迁移：删除仅针对旧文本解析规则的用例，把会话、摘要、失败恢复和持久化测试的响应/历史夹具迁移为原生协议；新增 22 个参数化回归场景覆盖正文透明性、原生参数深度与 ID 校验、纠错后恢复/耗尽、调度开关、结果类型和同步客户端异步适配。
+- 常规测试：`.venv/Scripts/python.exe -m pytest -q`，301 passed、12 skipped；通过项数变化来自旧协议用例移除与新原生场景替换。
+- 真实模型核心验证：`.venv/Scripts/python.exe -m pytest -q -m live tests/test_review_regressions.py tests/test_native_tools.py tests/test_memory_and_budget.py`，5 passed、61 deselected。覆盖原生调用、串行工具闭环、并行天气与依赖待办、压缩后追问及会话记忆 CRUD。并行天气场景使用真实模型与稳定的注入天气响应；本次未重跑其余 7 个 live 场景。

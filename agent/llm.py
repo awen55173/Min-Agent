@@ -79,17 +79,16 @@ def normalize_llm_response(item: Any) -> LLMResponse:
 
 
 class LLMClient(Protocol):
-    """约定真实客户端和模拟客户端的统一调用接口。"""
+    """原生模型调用接口，工具定义通过 tools 独立传入。"""
 
-    def chat(self, messages: list[Message]) -> str:
-        """接收消息列表并返回模型回复文本。"""
+    async def acomplete(self, messages: list[Message], tools: list[dict[str, Any]] | None = None,
+                        parallel_tool_calls: bool | None = None) -> LLMResponse:
+        """返回直接文本或原生工具调用列表。"""
         ...
 
 
 class OpenAIClient:
     """调用兼容 OpenAI 的同步与异步接口，支持自定义服务地址与原生函数工具调用。"""
-
-    supports_native_tools: bool = True
 
     def __init__(self, settings: Settings, temperature: float = 0.1, backoff: float = 1.0):
         """按配置创建同步与异步客户端，并保存模型参数、超时和重试策略。"""
@@ -125,7 +124,7 @@ class OpenAIClient:
 
     @staticmethod
     def _extract_response(resp) -> LLMResponse:
-        """从模型响应中提取统一的文本回答与工具调用列表；二者皆空时抛出 LLMError。"""
+        """从模型响应中提取统一的文本回答与工具调用列表；允许空正文交由运行时纠错。"""
         choices = getattr(resp, "choices", None)
         if not choices:
             raise LLMError("LLM response has no choices")
@@ -140,8 +139,6 @@ class OpenAIClient:
             arguments = str(getattr(fn, "arguments", "") or "{}") if fn is not None else "{}"
             cid = str(getattr(tc, "id", "") or f"call_{idx}")
             tool_calls.append(ToolCallItem(id=cid, name=name, arguments=arguments))
-        if not content.strip() and not tool_calls:
-            raise LLMError("LLM returned empty content and no tool_calls")
         return LLMResponse(content=content, tool_calls=tool_calls)
 
     def complete(
@@ -267,15 +264,11 @@ class OpenAIClient:
 class FakeLLM:
     """按顺序返回预设回复（支持同步与异步、纯文本或带 tool_calls 的 LLMResponse/字典），并记录收到的消息。"""
 
-    def __init__(self, replies: list[Any], native: bool | None = None):
-        """复制预设回复，并初始化调用记录；native=True 或回复含结构化响应时启用原生工具模式。"""
+    def __init__(self, replies: list[Any]):
+        """保存原生响应脚本及请求记录，字符串始终作为直接回答。"""
         self._replies = list(replies)
         self.calls: list[list[Message]] = []
         self.tools_passed: list[list[dict[str, Any]] | None] = []
-        if native is not None:
-            self.supports_native_tools = bool(native)
-        else:
-            self.supports_native_tools = any(isinstance(r, (LLMResponse, dict)) for r in self._replies)
 
     def complete(
         self,

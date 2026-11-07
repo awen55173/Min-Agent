@@ -32,16 +32,14 @@ WTTR = {
 }
 
 
-def J(**kw):
-    return json.dumps(kw, ensure_ascii=False)
-
-
 def act(tool, thought="secret-thought", **args):
-    return J(thought=thought, action=tool, action_input=args)
+    """构造原生工具调用测试响应。"""
+    return {"content": thought, "tool_calls": [{"id": "fixture_call", "type": "function", "function": {"name": tool, "arguments": json.dumps(args, ensure_ascii=False)}}]}
 
 
 def final(text, thought="secret-thought"):
-    return J(thought=thought, final_answer=text)
+    """构造直接文本回答。"""
+    return text
 
 
 def factory(store):
@@ -69,9 +67,9 @@ def test_estimate_tokens_and_split_turns():
     history = [
         {"role": "user", "content": "第一问"},
         {"role": "assistant", "content": "bad json"},
-        {"role": "user", "content": "Format error: invalid"},
-        {"role": "assistant", "content": act("weather", thought="思考1", city="Beijing")},
-        {"role": "user", "content": 'Observation (tool=weather, status=ok): {"city":"Beijing","temp_c":"20","description":"Sunny","humidity":"50"}'},
+        {"role": "user", "content": "Validation error: invalid"},
+        {"role": "assistant", **act("weather", thought="思考1", city="Beijing")},
+        {'role': 'tool', 'tool_call_id': 'fixture_call', 'name': 'weather', 'content': '{"city":"Beijing","temp_c":"20","description":"Sunny","humidity":"50"}'},
         {"role": "assistant", "content": final("北京20度", thought="思考2")},
         {"role": "user", "content": "第二问"},
         {"role": "assistant", "content": final("回答2", thought="思考3")},
@@ -85,7 +83,7 @@ def test_estimate_tokens_and_split_turns():
     assert len(cleaned) == 4
     for m in cleaned:
         assert "思考" not in m["content"]
-        assert not m["content"].startswith("Format error:")
+        assert not m["content"].startswith("Validation error:")
     # 原 history 未被就地修改
     assert "思考1" in history[3]["content"]
 
@@ -94,14 +92,14 @@ def test_estimate_tokens_and_split_turns():
 def test_summarize_turns_extracts_all_five_sections_and_drops_thought():
     turn1 = [
         {"role": "user", "content": "查北京天气、算 6*7、搜 Python 并记待办买牛奶"},
-        {"role": "assistant", "content": act("weather", thought="INTERNAL_THOUGHT_1", city="Beijing")},
-        {"role": "user", "content": 'Observation (tool=weather, status=ok): {"city":"Beijing","temp_c":"20","feels_like_c":"19","humidity":"50","description":"Sunny"}'},
-        {"role": "assistant", "content": act("calculator", thought="INTERNAL_THOUGHT_2", expression="6*7")},
-        {"role": "user", "content": 'Observation (tool=calculator, status=ok): {"expression":"6*7","result":42}'},
-        {"role": "assistant", "content": act("search", thought="INTERNAL_THOUGHT_3", query="python")},
-        {"role": "user", "content": 'Observation (tool=search, status=ok): {"query":"python","results":[{"title":"Py","url":"http://p","snippet":"lang"}]}'},
-        {"role": "assistant", "content": act("todo", thought="INTERNAL_THOUGHT_4", action="add", text="买牛奶")},
-        {"role": "user", "content": 'Observation (tool=todo, status=ok): {"created":true,"item":{"id":1,"text":"买牛奶","done":false}}'},
+        {"role": "assistant", **act("weather", thought="INTERNAL_THOUGHT_1", city="Beijing")},
+        {'role': 'tool', 'tool_call_id': 'fixture_call', 'name': 'weather', 'content': '{"city":"Beijing","temp_c":"20","feels_like_c":"19","humidity":"50","description":"Sunny"}'},
+        {"role": "assistant", **act("calculator", thought="INTERNAL_THOUGHT_2", expression="6*7")},
+        {'role': 'tool', 'tool_call_id': 'fixture_call', 'name': 'calculator', 'content': '{"expression":"6*7","result":42}'},
+        {"role": "assistant", **act("search", thought="INTERNAL_THOUGHT_3", query="python")},
+        {'role': 'tool', 'tool_call_id': 'fixture_call', 'name': 'search', 'content': '{"query":"python","results":[{"title":"Py","url":"http://p","snippet":"lang"}]}'},
+        {"role": "assistant", **act("todo", thought="INTERNAL_THOUGHT_4", action="add", text="买牛奶")},
+        {'role': 'tool', 'tool_call_id': 'fixture_call', 'name': 'todo', 'content': '{"created":true,"item":{"id":1,"text":"买牛奶","done":false}}'},
         {"role": "assistant", "content": final("都办好了", thought="INTERNAL_THOUGHT_5")},
     ]
     turn2 = [

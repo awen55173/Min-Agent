@@ -105,13 +105,13 @@ def test_native_schema_counted_in_context_build_and_each_request():
         build_context(messages[0]["content"], [], messages[1]["content"],
                       max_context_tokens=limit, reserved_tokens=0, tools_schema=schema)
 
-    llm = FakeLLM(["done"], native=True)
+    llm = FakeLLM(["done"])
     result = Agent(llm, registry, max_context_tokens=limit).run(
         "执行工具", context_messages=messages,
     )
     assert result.status == CONTEXT_LIMIT and llm.calls == []
 
-    async_llm = FakeLLM(["done"], native=True)
+    async_llm = FakeLLM(["done"])
     async_result = asyncio.run(Agent(async_llm, registry, max_context_tokens=limit).arun(
         "执行工具", context_messages=messages,
     ))
@@ -124,7 +124,7 @@ def test_native_budget_rechecked_after_tool_result():
                            lambda _args, _ctx: "result " + "x" * 150))
     messages = [{"role": "system", "content": "S"}, {"role": "user", "content": "go"}]
     limit = estimate_messages_tokens(messages) + estimate_tool_schema_tokens(registry.openai_tools()) + 15
-    llm = FakeLLM([{"tool_calls": [{"id": "c1", "name": "echo", "args": {}}]}, "done"], native=True)
+    llm = FakeLLM([{"tool_calls": [{"id": "c1", "name": "echo", "args": {}}]}, "done"])
     result = Agent(llm, registry, max_context_tokens=limit).run("go", context_messages=messages)
     assert result.status == CONTEXT_LIMIT
     assert len(result.actions) == 1 and len(llm.calls) == 1
@@ -178,7 +178,7 @@ def test_name_alias_and_anaphoric_request_recall():
 
 def test_service_recalls_name_and_trip_facts_without_stale_empty_notice(tmp_path):
     manager = SessionManager(tmp_path / "data")
-    llm = FakeLLM([json.dumps({"final_answer": "好"}, ensure_ascii=False) for _ in range(4)])
+    llm = FakeLLM(["好" for _ in range(4)])
     service = ChatService(llm, manager, lambda store: build_registry(todo_store=store),
                           max_history_turns=0)
     assert service.send("u", "s", "我的名字是林涛", create=True).status == "ok"
@@ -195,7 +195,7 @@ def test_service_recalls_name_and_trip_facts_without_stale_empty_notice(tmp_path
 
 def test_example_is_not_saved_and_remains_available_as_conversation_context(tmp_path):
     manager = SessionManager(tmp_path / "data")
-    llm = FakeLLM([json.dumps({"final_answer": "好"}, ensure_ascii=False) for _ in range(2)])
+    llm = FakeLLM(["好" for _ in range(2)])
     service = ChatService(llm, manager, lambda store: build_registry(todo_store=store))
     example = "请检查下面这段示例，不要记忆：\n我的城市是北京"
     service.send("u", "s", example, create=True)
@@ -209,7 +209,7 @@ def test_session_memory_update_delete_recall_and_source_isolation(tmp_path):
     manager = SessionManager(tmp_path / "data")
 
     def send(session, user_text, answer="好", create=False, max_history_turns=0):
-        llm = FakeLLM([json.dumps({"final_answer": answer}, ensure_ascii=False)])
+        llm = FakeLLM([answer])
         service = ChatService(llm, manager, lambda store: build_registry(todo_store=store),
                               max_history_turns=max_history_turns)
         result = service.send("u", session, user_text, create=create)
@@ -243,8 +243,8 @@ def test_session_memory_update_delete_recall_and_source_isolation(tmp_path):
 def test_tool_results_and_assistant_answers_never_create_user_memory(tmp_path):
     manager = SessionManager(tmp_path / "data")
     llm = FakeLLM([
-        json.dumps({"action": "weather", "action_input": {"city": "Beijing"}}),
-        json.dumps({"final_answer": "你住在北京，喜欢素食"}, ensure_ascii=False),
+        {"tool_calls": [{"id": "fixture_call", "name": "weather", "args": {"city": "Beijing"}}]},
+        "你住在北京，喜欢素食",
     ])
     service = ChatService(llm, manager, lambda store: build_registry(
         todo_store=store, http_get=lambda _url: {"current_condition": [{
@@ -260,9 +260,9 @@ def test_tool_results_and_assistant_answers_never_create_user_memory(tmp_path):
 def test_async_service_persists_and_recalls_user_memory(tmp_path):
     manager = SessionManager(tmp_path / "data")
     llm = FakeLLM([
-        json.dumps({"final_answer": "已记住"}, ensure_ascii=False),
-        json.dumps({"final_answer": "已更新"}, ensure_ascii=False),
-        json.dumps({"final_answer": "已删除"}, ensure_ascii=False),
+        "已记住",
+        "已更新",
+        "已删除",
     ])
     service = ChatService(llm, manager, lambda store: build_registry(todo_store=store))
 
@@ -301,15 +301,13 @@ def test_memory_precedes_summary_and_recent_history(max_history_turns):
     assert plan.messages[-1] == {"role": "user", "content": "按刚才的要求安排"}
 
 
-@pytest.mark.parametrize("native", [False, True])
 @pytest.mark.parametrize("use_async", [False, True])
-def test_memory_is_updated_before_same_turn_recall(tmp_path, native, use_async):
-    """验证两种工具模式及同步、异步入口均在本轮请求前召回最新记忆。"""
+def test_memory_is_updated_before_same_turn_recall(tmp_path, use_async):
+    """验证原生工具模式及同步、异步入口均在本轮请求前召回最新记忆。"""
     manager = SessionManager(tmp_path / "data")
-    answer = "好" if native else json.dumps({"final_answer": "好"}, ensure_ascii=False)
-    llm = FakeLLM([answer, answer, answer], native=native)
-    service = ChatService(llm, manager, lambda store: build_registry(todo_store=store),
-                          tool_mode="native" if native else "text")
+    answer = "好"
+    llm = FakeLLM([answer, answer, answer])
+    service = ChatService(llm, manager, lambda store: build_registry(todo_store=store))
     inputs = ["记住我的城市是苏州", "把我的城市改成杭州", "忘记我的城市"]
     for index, text in enumerate(inputs):
         if use_async:

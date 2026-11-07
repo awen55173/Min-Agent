@@ -40,7 +40,7 @@ def test_fake_llm_records_and_exhausts():
 
 
 def test_run_once_uses_agent_loop():
-    llm = FakeLLM(['{"thought": "t", "final_answer": "pong"}'])
+    llm = FakeLLM(["pong"])
     result = cli.run_once(llm, "ping")
     assert result.status == "ok" and result.answer == "pong"
     assert llm.calls[0][-1] == {"role": "user", "content": "ping"}

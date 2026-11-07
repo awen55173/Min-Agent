@@ -4,90 +4,27 @@ import pytest
 
 import cli
 from agent.llm import FakeLLM, LLMError
-from agent.loop import LLM_FAILED, MAX_STEPS, OK, PARSE_EXHAUSTED, Agent
-from agent.parser import ParseError, parse_output
-from agent.prompt import build_system_prompt
+from agent.loop import LLM_FAILED, MAX_STEPS, OK, OUTPUT_EXHAUSTED, Agent
 from agent.tools import TodoStore, build_registry
 
 WTTR = {"current_condition": [{"temp_C": "20", "FeelsLikeC": "19", "humidity": "50",
                                "weatherDesc": [{"value": "Sunny"}]}]}
 
 
-def J(**kw):
-    return json.dumps(kw, ensure_ascii=False)
-
-
 def act(tool, **args):
-    return J(thought="t", action=tool, action_input=args)
+    """构造原生工具调用测试响应。"""
+    return {"content": "", "tool_calls": [{"id": "fixture_call", "type": "function", "function": {"name": tool, "arguments": json.dumps(args, ensure_ascii=False)}}]}
 
 
 def final(text):
-    return J(thought="t", final_answer=text)
+    """构造直接文本回答。"""
+    return text
 
 
 @pytest.fixture
 def reg():
     return build_registry("key", todo_store=TodoStore(), http_get=lambda u: WTTR,
                           http_post=lambda u, b, k: {"results": []})
-
-
-# ---------------- parser ----------------
-def test_parse_plain_json_action(reg):
-    p = parse_output(act("calculator", expression="1+1"), reg)
-    assert (p.kind, p.action, p.action_input, p.thought) == ("action", "calculator", {"expression": "1+1"}, "t")
-
-
-def test_parse_final(reg):
-    p = parse_output(final(" hi "), reg)
-    assert p.kind == "final" and p.final_answer == "hi"
-
-
-def test_parse_code_block_and_reject_surrounding_text(reg):
-    text = "```json\n" + final("ok") + "\n```"
-    assert parse_output(text, reg).final_answer == "ok"
-    assert parse_output("```\n" + final("x") + "\n```", reg).final_answer == "x"
-    with pytest.raises(ParseError):
-        parse_output("Sure:\n```json\n" + final("ok") + "\n```\nbye", reg)
-    with pytest.raises(ParseError):
-        parse_output("I will answer " + final("x") + " done", reg)
-
-
-def test_parse_missing_thought_tolerated(reg):
-    assert parse_output('{"final_answer": "a"}', reg).thought == ""
-
-
-def test_parse_null_fields_treated_as_absent(reg):
-    p = parse_output('{"action": null, "final_answer": "a"}', reg)
-    assert p.kind == "final"
-
-
-@pytest.mark.parametrize("text,frag", [
-    (J(action="calculator", action_input={"expression": "1"}, final_answer="x"), "mutually exclusive"),
-    (J(thought="t"), "either"),
-    (J(action="calculator"), "action_input"),
-    (J(action="calculator", action_input={}), "missing required"),
-    (J(action="calculator", action_input={"expression": 1}), "must be string"),
-    (J(action="calculator", action_input="1+1"), "JSON object"),
-    (J(action="nope", action_input={}), "available tools"),
-    (J(action=5, action_input={}), "tool name"),
-    (J(final_answer=5), "string"),
-    ("just some text", "not valid JSON"),
-    ("", "empty"),
-    ("[1, 2]", "not valid JSON"),
-    ("{bad json", "not valid JSON"),
-])
-def test_parse_errors(reg, text, frag):
-    with pytest.raises(ParseError, match=frag):
-        parse_output(text, reg)
-
-
-# ---------------- prompt ----------------
-def test_prompt_contains_schema_and_format(reg):
-    p = build_system_prompt(reg)
-    for name in reg.names():
-        assert f'"name": "{name}"' in p
-    assert "final_answer" in p and "action_input" in p and "mutually exclusive" in p
-    assert '"required"' in p  # 参数 schema 已导出
 
 
 # ---------------- loop ----------------
@@ -110,10 +47,10 @@ def test_multi_tool_chain_weather_todo_reply(reg):
     assert [a.tool for a in r.actions] == ["weather", "todo", "todo"]
     assert all(a.ok for a in r.actions)
     # observation 依次回填
-    obs = [m["content"] for m in llm.calls[-1] if m["content"].startswith("Observation")]
+    obs = [m["content"] for m in llm.calls[-1] if m["role"] == "tool"]
     assert len(obs) == 3 and "Sunny" in obs[0] and '"created": true' in obs[1]
     # 最后一次调用能看到完整历史：system, user, (assistant, observation)*3
-    assert [m["role"] for m in llm.calls[-1]] == ["system", "user"] + ["assistant", "user"] * 3
+    assert [m["role"] for m in llm.calls[-1]] == ["system", "user"] + ["assistant", "tool"] * 3
 
 
 def test_tool_error_is_fed_back_and_model_recovers(reg):
@@ -125,41 +62,31 @@ def test_tool_error_is_fed_back_and_model_recovers(reg):
     r = Agent(llm, reg).run("calc")
     assert r.status == OK
     assert [a.ok for a in r.actions] == [False, True]
-    assert "status=error" in llm.calls[1][-1]["content"] and "division by zero" in llm.calls[1][-1]["content"]
+    assert "Error: " in llm.calls[1][-1]["content"] and "division by zero" in llm.calls[1][-1]["content"]
 
 
 def test_invalid_output_retried_then_succeeds(reg):
     llm = FakeLLM([
-        "not json", J(action="calculator", action_input={}, final_answer="x"),
+        "", {"tool_calls": [{"id": "bad", "name": "calculator", "args": {}}]},
         act("calculator", expression="1+1"), final("2"),
     ])
     r = Agent(llm, reg).run("q")
     assert r.status == OK and r.answer == "2" and len(r.actions) == 1
-    assert llm.calls[1][-1]["content"].startswith("Format error")
-    assert "mutually exclusive" in llm.calls[2][-1]["content"]
+    assert llm.calls[1][-1]["content"].startswith("Validation error")
+    assert "missing required" in llm.calls[2][-1]["content"]
 
 
-def test_conflicting_output_never_executes_tool():
-    store = TodoStore()
-    reg = build_registry(todo_store=store)
-    bad = J(action="todo", action_input={"action": "add", "text": "x"}, final_answer="done")
-    llm = FakeLLM([bad, final("ok")])
-    Agent(llm, reg).run("q", "u", "s")
-    from agent.tools import ToolContext
-    assert store.list(ToolContext("u", "s")) == []
-
-
-def test_parse_retries_exhausted(reg):
-    llm = FakeLLM(["bad"] * 4)
-    r = Agent(llm, reg, max_parse_retries=3).run("q")
-    assert r.status == PARSE_EXHAUSTED and "格式" in r.answer
+def test_output_retries_exhausted(reg):
+    llm = FakeLLM([""] * 4)
+    r = Agent(llm, reg, max_output_retries=3).run("q")
+    assert r.status == OUTPUT_EXHAUSTED and "无效" in r.answer
     assert len(llm.calls) == 4
 
 
-def test_parse_failure_counter_resets_after_valid_output(reg):
-    llm = FakeLLM(["bad", "bad", act("calculator", expression="1+1"), "bad", "bad", final("2")])
-    r = Agent(llm, reg, max_parse_retries=2).run("q")
-    assert r.status == OK
+def test_output_retry_budget_is_cumulative_after_valid_tool(reg):
+    llm = FakeLLM(["", "", act("calculator", expression="1+1"), "", "", final("2")])
+    r = Agent(llm, reg, max_output_retries=2).run("q")
+    assert r.status == OUTPUT_EXHAUSTED
 
 
 def test_max_steps_returns_clear_result_and_actions(reg):
@@ -177,11 +104,11 @@ def test_model_can_answer_after_last_allowed_step(reg):
 
 def test_llm_failure_keeps_completed_actions(reg):
     class Flaky(FakeLLM):
-        def chat(self, messages):
+        def complete(self, messages, **kwargs):
             if len(self.calls) == 1:
                 self.calls.append(messages)
                 raise LLMError("down")
-            return super().chat(messages)
+            return super().complete(messages, **kwargs)
 
     llm = Flaky([act("todo", action="add", text="x")])
     r = Agent(llm, reg).run("q")
@@ -226,20 +153,15 @@ def test_two_run_once_sharing_registry_do_not_merge_todos():
 
 @pytest.mark.parametrize("blank", ["", " ", "\n\t  \n"])
 def test_blank_final_answer_goes_through_format_correction(reg, blank):
-    llm = FakeLLM([J(thought="t", final_answer=blank), final("真正的答案")])
+    llm = FakeLLM([blank, final("真正的答案")])
     r = Agent(llm, reg).run("q")
     assert r.status == OK and r.answer == "真正的答案"
-    assert llm.calls[1][-1]["content"].startswith("Format error")
+    assert llm.calls[1][-1]["content"].startswith("Validation error")
 
 
 def test_blank_final_answer_retries_exhausted(reg):
-    r = Agent(FakeLLM([J(final_answer="  ")] * 4), reg, max_parse_retries=3).run("q")
-    assert r.status == PARSE_EXHAUSTED
-
-
-def test_parse_blank_final_answer_error(reg):
-    with pytest.raises(ParseError, match="non-blank"):
-        parse_output(J(final_answer=" \n "), reg)
+    r = Agent(FakeLLM(["  "] * 4), reg, max_output_retries=3).run("q")
+    assert r.status == OUTPUT_EXHAUSTED
 
 
 def test_observation_truncated():
@@ -277,7 +199,7 @@ def test_cli_nonzero_exit_on_failure(monkeypatch, capsys, tmp_path):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("LLM_API_KEY", "k")
     monkeypatch.setenv("LLM_MODEL", "m")
-    monkeypatch.setattr(cli, "OpenAIClient", lambda s: FakeLLM(["bad"] * 10))
+    monkeypatch.setattr(cli, "OpenAIClient", lambda s: FakeLLM([""] * 10))
     assert cli.main(["q"]) == 1
 
 

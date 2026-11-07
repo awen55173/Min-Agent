@@ -13,16 +13,14 @@ WTTR = {"current_condition": [{"temp_C": "20", "FeelsLikeC": "19", "humidity": "
                                "weatherDesc": [{"value": "Sunny"}]}]}
 
 
-def J(**kw):
-    return json.dumps(kw, ensure_ascii=False)
-
-
 def act(tool, **args):
-    return J(thought="t", action=tool, action_input=args)
+    """构造原生工具调用测试响应。"""
+    return {"content": "", "tool_calls": [{"id": "fixture_call", "type": "function", "function": {"name": tool, "arguments": json.dumps(args, ensure_ascii=False)}}]}
 
 
 def final(text):
-    return J(thought="t", final_answer=text)
+    """构造直接文本回答。"""
+    return text
 
 
 def factory(store):
@@ -102,7 +100,7 @@ def test_tool_followup_sees_previous_tool_results(tmp_path):
     svc.send("u", "s", "北京天气", create=True)
     svc, llm = service(tmp_path, [final("还是 20 度")])
     svc.send("u", "s", "刚才几度？")
-    assert any("Observation (tool=weather" in m["content"] and "Sunny" in m["content"] for m in llm.calls[0])
+    assert any(m["role"] == "tool" and m.get("name") == "weather" and "Sunny" in m["content"] for m in llm.calls[0])
 
 
 # ---------- 轮次与去重 ----------
@@ -126,7 +124,7 @@ def test_failure_results_still_persist_history_and_todos(tmp_path):
     d = state(tmp_path, "u", "s")
     assert todo_texts(d) == ["k"]
     assert d.history[0] == {"role": "user", "content": "loop"}
-    assert json.loads(d.history[-1]["content"])["final_answer"] == r.answer  # 失败提示入历史
+    assert d.history[-1]["content"] == r.answer  # 失败提示入历史
     # 之后可接着追问
     svc, llm = service(tmp_path, [final("还剩 1 条 k")])
     svc.send("u", "s", "现在有什么待办")
@@ -134,15 +132,15 @@ def test_failure_results_still_persist_history_and_todos(tmp_path):
 
 
 def test_parse_exhausted_and_llm_error_persist(tmp_path):
-    svc, _ = service(tmp_path, ["bad"] * 4, max_parse_retries=3)
-    assert svc.send("u", "p", "q", create=True).status == "parse_retries_exhausted"
+    svc, _ = service(tmp_path, [""] * 4, max_output_retries=3)
+    assert svc.send("u", "p", "q", create=True).status == "output_retries_exhausted"
     assert state(tmp_path, "u", "p").version == 1
 
     class Down(FakeLLM):
-        def chat(self, messages):
+        def complete(self, messages, **kwargs):
             if self.calls:
                 raise LLMError("down")
-            return super().chat(messages)
+            return super().complete(messages, **kwargs)
 
     llm = Down([act("todo", action="add", text="done-before-crash")])
     svc = ChatService(llm, SessionManager(tmp_path / "data"), factory)
@@ -154,10 +152,10 @@ def test_parse_exhausted_and_llm_error_persist(tmp_path):
 
 def test_internal_error_is_contained_and_saved(tmp_path):
     class Buggy(FakeLLM):
-        def chat(self, messages):
+        def complete(self, messages, **kwargs):
             if self.calls:
                 raise RuntimeError("bug")
-            return super().chat(messages)
+            return super().complete(messages, **kwargs)
 
     svc = ChatService(Buggy([act("todo", action="add", text="kept")]), SessionManager(tmp_path / "data"), factory)
     r = svc.send("u", "s", "q", create=True)
@@ -167,10 +165,10 @@ def test_internal_error_is_contained_and_saved(tmp_path):
 
 def test_keyboard_interrupt_saves_progress_and_releases_lock(tmp_path):
     class Interrupt(FakeLLM):
-        def chat(self, messages):
+        def complete(self, messages, **kwargs):
             if self.calls:
                 raise KeyboardInterrupt
-            return super().chat(messages)
+            return super().complete(messages, **kwargs)
 
     mgr = SessionManager(tmp_path / "data", lock_timeout=0.3)
     svc = ChatService(Interrupt([act("todo", action="add", text="kept")]), mgr, factory)
@@ -179,7 +177,7 @@ def test_keyboard_interrupt_saves_progress_and_releases_lock(tmp_path):
     d = state(tmp_path, "u", "s")
     assert todo_texts(d) == ["kept"]
     assert d.history[0]["content"] == "记一下"
-    assert INTERRUPTED_NOTE in json.loads(d.history[-1]["content"])["final_answer"]
+    assert INTERRUPTED_NOTE in d.history[-1]["content"]
     with mgr.open("u", "s"):  # 锁已释放
         pass
 

@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from agent.config import ConfigError, Settings
-from agent.llm import LLMError, Message, OpenAIClient
+from agent.llm import FakeLLM, LLMError, Message, OpenAIClient
 from agent.loop import (
     CONTEXT_LIMIT,
      INTERNAL_ERROR,
@@ -15,7 +15,7 @@ from agent.loop import (
     LLM_FAILED,
     MAX_STEPS,
     OK,
-    PARSE_EXHAUSTED,
+    OUTPUT_EXHAUSTED,
     PERSIST_FAILED,
     TOOL_NOT_EXECUTED,
     Agent,
@@ -34,33 +34,19 @@ from agent.trace import (
 import cli
 
 
-class ScriptedLLM:
-    """按预设脚本依次返回响应或抛出异常的假模型。"""
+class ScriptedLLM(FakeLLM):
+    """使用原生响应和可调用步骤的测试模型。"""
 
-    def __init__(self, steps: list):
-        """初始化预设步骤列表。"""
-        self._steps = list(steps)
-        self.calls: list[list[Message]] = []
-
-    def chat(self, messages: list[Message]) -> str:
-        """记录请求消息并执行下一步预设动作。"""
-        self.calls.append([dict(m) for m in messages])
-        step = self._steps.pop(0)
-        if isinstance(step, BaseException):
-            raise step
-        if callable(step):
-            return step(messages)
-        return step
 
 
 def _act(tool: str, thought: str = "t", **kwargs) -> str:
-    """构造工具调用 JSON 字符串。"""
-    return json.dumps({"thought": thought, "action": tool, "action_input": kwargs}, ensure_ascii=False)
+    """构造原生工具调用测试响应。"""
+    return {"content": thought, "tool_calls": [{"id": "fixture_call", "type": "function", "function": {"name": tool, "arguments": json.dumps(kwargs, ensure_ascii=False)}}]}
 
 
 def _fin(text: str, thought: str = "done") -> str:
-    """构造最终回答 JSON 字符串。"""
-    return json.dumps({"thought": thought, "final_answer": text}, ensure_ascii=False)
+    """构造直接文本回答。"""
+    return text
 
 
 def _make_service(tmp_path: Path, llm, **kwargs) -> tuple[SessionManager, ChatService, TraceLogger]:
@@ -581,24 +567,24 @@ def test_trace_integrity_across_normal_and_all_failure_paths(tmp_path: Path):
     assert "未完成说明" in r_max.answer
     assert verify_trace_integrity(trace.read_events("u", "s_max"))["valid"] is True
 
-    # 3) parse_retries_exhausted
-    llm_parse = ScriptedLLM(["not json 1", "not json 2"])
+    # 3) output_retries_exhausted
+    llm_parse = ScriptedLLM(["", ""])
     svc_parse = ChatService(
-        llm_parse, mgr, lambda s: build_registry(todo_store=s), max_parse_retries=1, trace_logger=trace,
+        llm_parse, mgr, lambda s: build_registry(todo_store=s), max_output_retries=1, trace_logger=trace,
     )
     r_parse = svc_parse.send("u", "s_parse", "胡言乱语", create=True)
-    assert r_parse.status == PARSE_EXHAUSTED
+    assert r_parse.status == OUTPUT_EXHAUSTED
     assert "未完成说明" in r_parse.answer
     ev_parse = trace.read_events("u", "s_parse")
-    assert any(e["event"] == "parse_error" for e in ev_parse)
+    assert any(e["event"] == "validation_error" for e in ev_parse)
     assert verify_trace_integrity(ev_parse)["valid"] is True
 
     # 4) tool_not_executed（混入伪造工具输出后直接给 final_answer）
     llm_unexec = ScriptedLLM([
-        '{"action": "todo", "action_input": {"action": "add", "text": "x"}} extra garbage',
+        {"tool_calls": [{"id": "bad", "name": "todo", "arguments": "{broken"}]},
         _fin("我已经帮你添加好了"),
     ])
-    svc_unexec = ChatService(llm_unexec, mgr, lambda s: build_registry(todo_store=s), trace_logger=trace)
+    svc_unexec = ChatService(llm_unexec, mgr, lambda s: build_registry(todo_store=s), trace_logger=trace, max_output_retries=1)
     r_unexec = svc_unexec.send("u", "s_unexec", "加待办", create=True)
     assert r_unexec.status == TOOL_NOT_EXECUTED
     assert "未完成说明" in r_unexec.answer

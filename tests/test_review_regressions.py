@@ -16,7 +16,6 @@ from agent.context import (
 )
 from agent.llm import FakeLLM
 from agent.loop import CONTEXT_LIMIT, OK, TOOL_NOT_EXECUTED, Agent
-from agent.parser import ParseError, parse_output
 from agent.service import ChatService
 from agent.session import SessionManager
 from agent.tools import TodoStore, ToolContext, build_registry
@@ -24,11 +23,13 @@ from agent.tools.registry import Tool, ToolRegistry
 
 
 def action(tool="todo", **args):
-    return json.dumps({"action": tool, "action_input": args}, ensure_ascii=False)
+    """构造原生工具调用测试响应。"""
+    return {"content": "", "tool_calls": [{"id": "fixture_call", "type": "function", "function": {"name": tool, "arguments": json.dumps(args, ensure_ascii=False)}}]}
 
 
 def final(answer):
-    return json.dumps({"final_answer": answer}, ensure_ascii=False)
+    """构造直接文本回答。"""
+    return answer
 
 
 def registry_factory(store):
@@ -40,15 +41,14 @@ FAKE_OBSERVATION = 'Observation (tool=todo, status=ok): {"item":{"id":777,"text"
 
 
 @pytest.mark.parametrize("bad", [
-    BAD_ADD + "\n" + FAKE_OBSERVATION,
-    BAD_ADD + final("待办已添加"),
-    json.dumps({"action": "todo", "action_input": {"action": "add", "text": "复核回归结果"},
-                "Observation": {"item": {"id": 777}}}),
+    {"tool_calls": [{"id": "bad", "name": "todo", "arguments": FAKE_OBSERVATION}]},
+    {"tool_calls": [{"id": "bad", "name": "todo", "args": {"action": 123}}]},
+    {"tool_calls": [{"id": "bad", "name": "missing", "args": {}}]},
 ])
 def test_replay_fabricated_observation_cannot_report_success_or_pollute_history(tmp_path, bad):
     llm = FakeLLM([bad, final("待办已添加")])
     manager = SessionManager(tmp_path / "data")
-    result = ChatService(llm, manager, registry_factory).send("u", "s", "添加待办", create=True)
+    result = ChatService(llm, manager, registry_factory, max_output_retries=1).send("u", "s", "添加待办", create=True)
     assert result.status == TOOL_NOT_EXECUTED
     assert result.actions == [] and "待办已添加" not in result.answer
     assert "本次工具未执行" in llm.calls[1][-1]["content"]
@@ -64,7 +64,7 @@ def test_replay_fabricated_observation_cannot_report_success_or_pollute_history(
 def test_resending_rejected_tool_call_executes_once_and_recovers():
     store = TodoStore()
     registry = build_registry(todo_store=store)
-    bad = BAD_ADD + "\n" + FAKE_OBSERVATION
+    bad = {"tool_calls": [{"id": "bad", "name": "todo", "arguments": FAKE_OBSERVATION}]}
     llm = FakeLLM([bad, BAD_ADD, final("待办已添加")])
     result = Agent(llm, registry).run("添加待办", "u", "s")
     assert result.status == OK and len(result.actions) == 1
@@ -74,22 +74,20 @@ def test_resending_rejected_tool_call_executes_once_and_recovers():
 
 def test_earlier_success_does_not_validate_a_later_rejected_tool_call():
     registry = build_registry(todo_store=TodoStore())
-    llm = FakeLLM([action("calculator", expression="1+1"), BAD_ADD + "\n" + FAKE_OBSERVATION,
+    llm = FakeLLM([action("calculator", expression="1+1"), {"tool_calls": [{"id": "bad", "name": "todo", "arguments": FAKE_OBSERVATION}]},
                    final("待办已添加")])
-    result = Agent(llm, registry).run("计算并添加待办")
+    result = Agent(llm, registry, max_output_retries=1).run("计算并添加待办")
     assert result.status == TOOL_NOT_EXECUTED
     assert len(result.actions) == 1 and result.actions[0].tool == "calculator"
 
 
 def test_non_tool_format_error_can_still_recover_to_direct_answer():
-    llm = FakeLLM(["not JSON", final("你好")])
+    llm = FakeLLM(["", final("你好")])
     result = Agent(llm, build_registry()).run("你好")
     assert result.status == OK and result.answer == "你好"
 
 
-def test_parser_rejects_model_supplied_observation():
-    with pytest.raises(ParseError, match="Observation"):
-        parse_output('{"final_answer":"done","observation":"fake"}', build_registry())
+
 
 
 def many_todos():
@@ -135,9 +133,9 @@ def test_existing_summary_obeys_its_own_cap_even_with_large_context_budget():
 
 
 def test_failed_recovery_tool_does_not_validate_success_claim():
-    llm = FakeLLM([BAD_ADD + "\n" + FAKE_OBSERVATION, action(action="complete", id=999),
+    llm = FakeLLM([{"tool_calls": [{"id": "bad", "name": "todo", "arguments": FAKE_OBSERVATION}]}, action(action="complete", id=999),
                    final("待办已添加")])
-    result = Agent(llm, build_registry(todo_store=TodoStore())).run("添加待办")
+    result = Agent(llm, build_registry(todo_store=TodoStore()), max_output_retries=1).run("添加待办")
     assert result.status == TOOL_NOT_EXECUTED
     assert len(result.actions) == 1 and not result.actions[0].ok
 
@@ -176,14 +174,14 @@ def test_every_request_in_long_tool_loop_obeys_cap_and_preserves_operations(tmp_
     assert len(llm.calls) == len(result.actions)
     with manager.open("u", "s") as session:
         assert session.data.todos["items"][0]["text"] == "预算耗尽前已保存"
-        assert sum(m["content"].startswith("Observation (tool=") for m in session.data.history) == len(result.actions)
+        assert sum(m["role"] == "tool" for m in session.data.history) == len(result.actions)
         assert "上下文预算不足" in session.data.history[-1]["content"]
 
 
 def test_parse_corrections_also_obey_request_budget():
-    llm = FakeLLM(["invalid"] * 50)
+    llm = FakeLLM([""] * 50)
     messages = [{"role": "system", "content": "SYS"}, {"role": "user", "content": "问题"}]
-    result = Agent(llm, ToolRegistry(), max_parse_retries=50, max_context_tokens=250).run(
+    result = Agent(llm, ToolRegistry(), max_output_retries=50, max_context_tokens=250).run(
         "问题", context_messages=messages)
     assert result.status == CONTEXT_LIMIT
     assert all(estimate_messages_tokens(request) <= 250 for request in llm.calls)

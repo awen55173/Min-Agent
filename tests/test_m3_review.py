@@ -8,23 +8,20 @@ import pytest
 
 from agent.llm import FakeLLM
 from agent.loop import OK, Agent
-from agent.parser import ParseError, parse_output
 from agent.service import INTERRUPTED_NOTE, ChatService
 from agent.session import LockLostError, SessionBusyError, SessionManager
 from agent.tools import ToolContext, TodoStore, build_registry
 from agent.tools.registry import Tool
 
 
-def J(**kw):
-    return json.dumps(kw, ensure_ascii=False)
-
-
 def act(tool, **args):
-    return J(thought="t", action=tool, action_input=args)
+    """构造原生工具调用测试响应。"""
+    return {"content": "", "tool_calls": [{"id": "fixture_call", "type": "function", "function": {"name": tool, "arguments": json.dumps(args, ensure_ascii=False)}}]}
 
 
 def final(text):
-    return J(thought="t", final_answer=text)
+    """构造直接文本回答。"""
+    return text
 
 
 def lock_path(mgr, user="u", sid="s"):
@@ -156,11 +153,11 @@ class InterruptOnCall(FakeLLM):
         super().__init__(replies)
         self.at = at
 
-    def chat(self, messages):
+    def complete(self, messages, **kwargs):
         if len(self.calls) == self.at:
             self.calls.append(messages)
             raise KeyboardInterrupt
-        return super().chat(messages)
+        return super().complete(messages, **kwargs)
 
 
 def history(tmp_path):
@@ -175,10 +172,10 @@ def test_interrupt_after_tool_keeps_tool_call_and_observation(tmp_path):
         ChatService(llm, mgr, factory_with()).send("u", "s", "记一下买牛奶", create=True)
     h, todos = history(tmp_path)
     roles = [m["role"] for m in h]
-    assert roles == ["user", "assistant", "user", "assistant"]
-    assert json.loads(h[1]["content"])["action"] == "todo"
-    assert h[2]["content"].startswith("Observation (tool=todo, status=ok)") and "buy milk" in h[2]["content"]
-    assert INTERRUPTED_NOTE in json.loads(h[3]["content"])["final_answer"]
+    assert roles == ["user", "assistant", "tool", "assistant"]
+    assert h[1]["tool_calls"][0]["function"]["name"] == "todo"
+    assert h[2]["role"] == "tool" and "buy milk" in h[2]["content"]
+    assert INTERRUPTED_NOTE in h[3]["content"]
     assert todos["items"][0]["text"] == "buy milk"
 
     # 恢复后追问：模型能看到之前的工具调用与 observation
@@ -186,7 +183,7 @@ def test_interrupt_after_tool_keeps_tool_call_and_observation(tmp_path):
     r = ChatService(llm2, mgr, factory_with()).send("u", "s", "我刚才记了什么？")
     assert r.status == OK
     seen = llm2.calls[0]
-    assert any(m["content"].startswith("Observation (tool=todo, status=ok)") for m in seen)
+    assert any(m["role"] == "tool" and m.get("name") == "todo" for m in seen)
     assert [m["role"] for m in seen].count("system") == 1
 
 
@@ -200,7 +197,7 @@ def test_interrupt_during_tool_execution_records_unknown_outcome(tmp_path):
     with pytest.raises(KeyboardInterrupt):
         ChatService(llm, mgr, factory_with(slow)).send("u", "s", "go", create=True)
     h, todos = history(tmp_path)
-    assert [m["role"] for m in h] == ["user", "assistant", "user", "assistant", "user", "assistant"]
+    assert [m["role"] for m in h] == ["user", "assistant", "tool", "assistant", "tool", "assistant"]
     assert "status=interrupted" in h[4]["content"] and "tool=slow" in h[4]["content"]
     assert len(todos["items"]) == 1
     assert not lock_path(mgr).exists()
@@ -211,17 +208,17 @@ def test_interrupt_before_tool_runs_drops_unexecuted_output(tmp_path):
     mgr = SessionManager(tmp_path / "data")
 
     class InterruptInParse(FakeLLM):
-        def chat(self, messages):
-            out = super().chat(messages)
+        def complete(self, messages, **kwargs):
+            out = super().complete(messages, **kwargs)
             if len(self.calls) == 2:
                 import agent.loop as loop_mod
-                orig = loop_mod.parse_output
+                orig = loop_mod._Turn.prepare_reply
 
                 def raise_once(*a, **k):
-                    loop_mod.parse_output = orig
+                    loop_mod._Turn.prepare_reply = orig
                     raise KeyboardInterrupt
 
-                loop_mod.parse_output = raise_once
+                loop_mod._Turn.prepare_reply = raise_once
             return out
 
     llm = InterruptInParse([act("todo", action="add", text="a"), act("todo", action="add", text="b")])
@@ -230,7 +227,7 @@ def test_interrupt_before_tool_runs_drops_unexecuted_output(tmp_path):
     h, todos = history(tmp_path)
     assert [i["text"] for i in todos["items"]] == ["a"]
     assert not any('"b"' in m["content"] for m in h)
-    assert [m["role"] for m in h] == ["user", "assistant", "user", "assistant"]
+    assert [m["role"] for m in h] == ["user", "assistant", "tool", "assistant"]
 
 
 def test_agent_attaches_partial_result_to_interrupt():
@@ -240,76 +237,3 @@ def test_agent_attaches_partial_result_to_interrupt():
         Agent(llm, reg).run("q")
     r = ei.value.agent_result
     assert r.status == "interrupted" and len(r.actions) == 1 and "todo" in r.answer
-
-
-# ---------------- 歧义输出 ----------------
-@pytest.fixture
-def reg():
-    return build_registry(todo_store=TodoStore())
-
-
-@pytest.mark.parametrize("text", [
-    act("todo", action="add", text="x") + final("done"),
-    act("todo", action="add", text="x") + "\n" + act("todo", action="add", text="y"),
-    "```json\n" + act("todo", action="add", text="x") + "\n```\n```json\n" + final("ok") + "\n```",
-    "first " + final("a") + " then " + final("b"),
-])
-def test_multiple_json_objects_rejected(reg, text):
-    with pytest.raises(ParseError, match="ambiguous"):
-        parse_output(text, reg)
-
-
-def test_single_object_in_fence_with_braces_in_string_still_ok(reg):
-    text = "```json\n" + act("todo", action="add", text="a {b} c") + "\n```"
-    p = parse_output(text, reg)
-    assert p.action == "todo" and p.action_input["text"] == "a {b} c"
-
-
-@pytest.mark.parametrize("bad_output", [
-    "[" + act("todo", action="add", text="in-array") + "]",
-    "```json\n[" + act("todo", action="add", text="in-fenced-array") + "]\n```",
-    '{"outer": ' + act("todo", action="add", text="in-broken-outer"),
-    '{"outer": ' + act("todo", action="add", text="in-wrapped-outer") + "}",
-    "Sure, here it is: " + act("todo", action="add", text="in-prose") + " -- thanks",
-    "```json\n" + act("todo", action="add", text="unclosed-fence"),
-])
-def test_wrapped_or_partial_outputs_rejected_and_never_execute_tool(bad_output):
-    store = TodoStore()
-    reg = build_registry(todo_store=store)
-    with pytest.raises(ParseError):
-        parse_output(bad_output, reg)
-    llm = FakeLLM([bad_output, final("ok")])
-    r = Agent(llm, reg).run("q", "u", "s")
-    assert r.status == "tool_not_executed" and r.actions == []
-    assert store.list(ToolContext("u", "s")) == []
-    assert llm.calls[1][-1]["content"].startswith("Format error:")
-
-
-@pytest.mark.parametrize("deep", [
-    '{"a":' * 2000 + "1" + "}" * 2000,
-    "[" * 2000 + "]" * 2000,
-    '{"action": "todo", "action_input": ' + '{"a":' * 60 + "1" + "}" * 61,
-])
-def test_deeply_nested_input_triggers_format_correction_not_internal_error(deep):
-    store = TodoStore()
-    reg = build_registry(todo_store=store)
-    with pytest.raises(ParseError):
-        parse_output(deep, reg)
-    llm = FakeLLM([deep, final("recovered")])
-    r = Agent(llm, reg).run("q", "u", "s")
-    assert r.status == ("tool_not_executed" if '"action"' in deep else OK)
-    if r.status == OK:
-        assert r.answer == "recovered"
-    assert llm.calls[1][-1]["content"].startswith("Format error:")
-    r_exhausted = Agent(FakeLLM([deep] * 4), reg, max_parse_retries=3).run("q", "u", "s")
-    assert r_exhausted.status == "parse_retries_exhausted"
-
-
-def test_ambiguous_output_never_executes_tool():
-    store = TodoStore()
-    reg = build_registry(todo_store=store)
-    llm = FakeLLM([act("todo", action="add", text="x") + final("done"), final("ok")])
-    r = Agent(llm, reg).run("q", "u", "s")
-    assert r.status == "tool_not_executed" and r.actions == []
-    assert store.list(ToolContext("u", "s")) == []
-    assert "ambiguous" in llm.calls[1][-1]["content"]

@@ -73,18 +73,36 @@ uv run python cli.py -u alice --list
 
 默认数据路径为 `data/{user_id}/{session_id}.json`，Trace 位于 `data/traces/`。可使用 `--data-dir` 和 `--trace-dir` 指定其他路径。`-v` 在标准错误输出中显示工具调用过程。
 
-## 工具模式与执行
+## 原生工具调用与执行
 
-默认 `native` 模式使用原生 function calling；`text` 模式要求模型按 JSON 文本协议输出，便于兼容不支持原生工具的服务：
+仅使用原生 function calling：Schema 通过 API `tools` 参数传递，读取响应的 `tool_calls` 后执行，结果以 `role=tool` 和 `tool_call_id` 回填。无工具调用时，`content` 就是直接回答；不要求模型输出 `thought/action/action_input/final_answer` JSON，也不从回答文本解析工具指令。模型服务必须支持原生工具调用。
 
 ```powershell
-uv run python cli.py --tool-mode native -u alice "计算 3 * 9"
-uv run python cli.py --tool-mode text -u alice "计算 3 * 9"
+uv run python cli.py -u alice "计算 3 * 9"
 ```
 
 注册表提供 calculator、todo、search 和 weather。模型可以在一次响应中请求多个工具。Agent 仅并行执行无依赖的只读调用（weather、search、calculator），并发默认上限为 4；写操作保持串行，涉及同批待办读写时也按序执行。依赖型任务由模型分轮请求，例如先查天气、收到真实结果后再创建待办。并行调度可由 `ChatService(parallel_tool_calls=...)` 控制；CLI 使用默认开启设置。
 
 同步工具通过工作线程运行。只读工具超时后可能仍在后台执行，结果状态为未确定；写工具超时后会等待实际完成再返回，以避免重复副作用。LLM 请求失败会按配置重试；工具调用按 session 和轮次幂等记录，恢复时复用已落盘的写操作。
+
+## Agent 循环与预算
+
+主循环在 `agent/loop.py`，每轮使用独立状态，依次调用：
+
+| 方法 | 作用 |
+| --- | --- |
+| `may_think` | 检查工具步数、累计纠错和模型请求预算 |
+| `think` | 检查 messages + tools 总预算，调用模型并区分回答/原生调用 |
+| `disputed` | 校验非空文本和非法工具调用后的回答，必要时反馈重试 |
+| `perform` | 执行一个只读并行组或单项串行操作 |
+| `observe` | 按调用 ID 回填经过序列化与截断的结果，写操作即时保存 |
+| `accept` | 接受直接文本回答，保存后记录终止事件 |
+
+`perform` / `observe` 及幂等、中断处理位于 `agent/execution.py`；`agent/tool_call.py` 只解析原生工具的参数 JSON 并按 Schema 校验；`agent/runtime.py` 定义结果和失败类型。`run` 复用异步循环，同步模型接口在工作线程执行；已有事件循环时使用 `await arun(...)`。
+
+默认最多执行 8 次工具调用、允许 3 次纠错重试；纠错次数在本轮累计，不因一次成功工具调用清零。模型最多请求 `max_steps + max_output_retries + 1` 次，最后一次用于生成回答；刚好用满工具步数仍可总结结果，但不能再执行工具。API 网络重试由 `LLM_MAX_RETRIES` 单独控制。超过预算由 `ModelOutputError` 进入统一失败收尾，保存已完成操作；上下文超限返回 `context_limit`。空回答等纠错耗尽状态为 `output_retries_exhausted`，Trace 事件为 `validation_error`。
+
+本次移除了 `--tool-mode`、`tool_mode` 配置和旧文本协议解析；`max_parse_retries` 参数改名为 `max_output_retries`。已有原生会话可继续恢复；早期文本协议的历史正文仅作为普通文本保留和显示，不再解码成工具调用或最终答案，建议这些旧会话新建 session。
 
 ## Session、上下文与记忆
 
@@ -114,7 +132,7 @@ uv run python cli.py --tool-mode text -u alice "计算 3 * 9"
 4. 将上下文交给 Agent；本轮后续工具循环沿用这些消息并追加工具请求、结果，不从工具结果重新提取用户记忆。
 5. 记忆随会话保存到 `data/{user_id}/{session_id}.json` 的 `memories` 字段；正常轮次结束时保存，工具写操作即时保存时也会带上当前记忆。保存成功后，重启并恢复同一用户、同一 session 可继续使用。
 
-召回在**每轮第一次模型请求前**执行。同步 `send`、异步 `asend` 以及 `native` / `text` 模式采用相同规则；不同用户或不同 session 不共享记忆。
+召回在**每轮第一次模型请求前**执行。同步 `send` 与异步 `asend` 采用相同的原生调用和记忆规则；不同用户或不同 session 不共享记忆。
 
 ### 召回条件
 
@@ -157,7 +175,7 @@ user：本轮用户输入
 uv run python cli.py -u alice -s <session_id> --trace
 ```
 
-Trace 记录轮次、工具请求和结果、耗时、错误及结束状态。恢复未完成轮次时，已成功落盘的写调用会复用；不确定调用会先核对待办状态。非法工具调用及伪造 Observation 不会作为执行结果保存，工具未执行却声称成功时返回 `tool_not_executed`。
+Trace 记录轮次、工具请求和结果、耗时、错误及结束状态。恢复未完成轮次时，已成功落盘的写调用会复用；不确定调用会先核对待办状态。非法工具调用不执行、不作为成功事实保存。空回答或非法原生调用回填校验原因并消耗累计纠错预算；非法调用后直接声称完成也会要求重试，耗尽时返回 `tool_not_executed`。工具执行失败仍作为真实 `tool` 结果供模型解释或修正。
 
 ## 验收
 

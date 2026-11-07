@@ -283,7 +283,7 @@ class TraceLogger:
         self.append(ev)
         return ev
 
-    def log_parse_error(
+    def log_validation_error(
         self,
         user_id: str,
         session_id: str,
@@ -292,9 +292,9 @@ class TraceLogger:
         error: str,
         attempt_id: int | str = 1,
     ) -> dict[str, Any]:
-        """记录模型输出解析失败事件。"""
+        """记录原生调用或回答校验失败事件。"""
         ev = {
-            "event": "parse_error",
+            "event": "validation_error",
             "user_id": user_id,
             "session_id": session_id,
             "turn_id": turn_id,
@@ -380,7 +380,7 @@ class TraceLogger:
                     f"attempt={attempt_id} {ev.get('tool')} status={ev.get('status')} ok={ev.get('ok')} "
                     f"duration={ev.get('duration_ms')}ms{reused_tag}{err_tag} -> {ev.get('result')}"
                 )
-            elif kind == "parse_error":
+            elif kind == "validation_error":
                 lines.append(
                     f"[turn {turn_id}][step {ev.get('step')}] PARSE_ERROR attempt={attempt_id} {ev.get('error')}"
                 )

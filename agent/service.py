@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import copy
-import json
 import re
 from typing import Any, Callable
 
@@ -63,42 +62,30 @@ class ChatService:
         manager: SessionManager,
         registry_factory: RegistryFactory,
         max_steps: int = 8,
-        max_parse_retries: int = 3,
+        max_output_retries: int = 3,
         max_history_turns: int = 6,
         max_context_tokens: int = DEFAULT_CONTEXT_TOKENS,
         reserved_tokens: int = DEFAULT_RESERVED_TOKENS,
         trace_logger: TraceLogger | None = None,
-        tool_mode: str = "native",
         tool_timeout: float | None = None,
         parallel_tool_calls: bool = True,
         max_concurrency: int = 4,
     ):
         """保存依赖及循环/上下文预算参数。"""
-        if tool_mode not in ("native", "text"):
-            raise ValueError(f"unsupported tool_mode: {tool_mode!r} (expected 'native' or 'text')")
         if max_concurrency < 1:
             raise ValueError(f"max_concurrency must be >= 1, got {max_concurrency}")
         self._llm = llm
         self._manager = manager
         self._factory = registry_factory
         self._max_steps = max_steps
-        self._max_parse_retries = max_parse_retries
+        self._max_output_retries = max_output_retries
         self._max_history_turns = max_history_turns
         self._max_context_tokens = max_context_tokens
         self._reserved_tokens = reserved_tokens
         self._trace_logger = trace_logger or TraceLogger(self._manager._root / "traces")
-        self._tool_mode = tool_mode
         self._tool_timeout = tool_timeout
         self._parallel_tool_calls = parallel_tool_calls
         self._max_concurrency = max_concurrency
-
-    def _effective_tool_mode(self) -> str:
-        """确定当前会话请求的实际工具模式：显式 text 或客户端不支持原生工具时走 text。"""
-        if self._tool_mode == "text":
-            return "text"
-        if getattr(self._llm, "supports_native_tools", False):
-            return "native"
-        return "text"
 
     @property
     def trace_logger(self) -> TraceLogger:
@@ -121,11 +108,10 @@ class ChatService:
         """
         with self._manager.open(user_id, session_id, create=create) as session:
             data = session.data
-            mode = self._effective_tool_mode()
             if data.history:
                 data.history = _ensure_tool_Pairs(data.history)
                 if data.history[-1].get("role") in ("user", "tool"):
-                    data.history.append(_assistant_final(INTERRUPTED_NOTE, mode=mode))
+                    data.history.append(_assistant_final(INTERRUPTED_NOTE))
 
             if _is_retry_request(data.unfinished_turn, text, retry=retry):
                 assert data.unfinished_turn is not None
@@ -146,7 +132,7 @@ class ChatService:
             data.memories = apply_user_memory(data.memories, text)
             try:
                 ctx_plan = build_context(
-                    system_prompt=build_system_prompt(registry, tool_mode=mode),
+                    system_prompt=build_system_prompt(registry),
                     history=data.history,
                     user_input=text,
                     existing_summary=data.summary,
@@ -154,7 +140,7 @@ class ChatService:
                     max_history_turns=self._max_history_turns,
                     max_context_tokens=self._max_context_tokens,
                     reserved_tokens=self._reserved_tokens,
-                    tools_schema=registry.openai_tools() if mode == "native" else None,
+                    tools_schema=registry.openai_tools(),
                     recalled_memories=select_memories(data.memories, text),
                     memory_question=wants_memory_recall(text),
                     session_memories=data.memories,
@@ -166,7 +152,7 @@ class ChatService:
                 )
                 prev_history = list(data.history)
                 prev_unfinished = copy.deepcopy(data.unfinished_turn)
-                messages = [{"role": "user", "content": text}, _assistant_final(ans, mode=mode)]
+                messages = [{"role": "user", "content": text}, _assistant_final(ans)]
                 data.history += messages
                 data.unfinished_turn = {
                     "turn_id": turn_id,
@@ -234,7 +220,7 @@ class ChatService:
                 prev_unfinished = copy.deepcopy(data.unfinished_turn)
                 new_messages = list(cur_messages[prefix_len:])
                 if status != OK:
-                    new_messages.append(_assistant_final(answer, mode=mode))
+                    new_messages.append(_assistant_final(answer))
                     data.unfinished_turn = {
                         "turn_id": turn_id,
                         "attempt": attempt_id,
@@ -259,10 +245,9 @@ class ChatService:
                 self._llm,
                 registry,
                 self._max_steps,
-                self._max_parse_retries,
+                self._max_output_retries,
                 max_context_tokens=self._max_context_tokens,
                 trace_logger=self._trace_logger,
-                tool_mode=self._tool_mode,
                 parallel_tool_calls=self._parallel_tool_calls,
                 tool_timeout=self._tool_timeout,
                 max_concurrency=self._max_concurrency,
@@ -287,7 +272,7 @@ class ChatService:
                     new_messages = partial.messages[prefix_len:]
                 else:  # 尚未进入循环就被中断
                     new_messages = [{"role": "user", "content": text}]
-                new_messages.append(_assistant_final(INTERRUPTED_NOTE, mode=mode))
+                new_messages.append(_assistant_final(INTERRUPTED_NOTE))
                 data.history = base_history + new_messages
                 data.todos = store.export_state(ctx)
                 data.summary = refresh_summary_todos(data.summary, data.todos)
@@ -316,11 +301,10 @@ class ChatService:
         """异步在会话内处理一轮输入并保存，使用非阻塞会话锁与异步保存避免阻塞其他并发会话。"""
         async with self._manager.aopen(user_id, session_id, create=create) as session:
             data = session.data
-            mode = self._effective_tool_mode()
             if data.history:
                 data.history = _ensure_tool_Pairs(data.history)
                 if data.history[-1].get("role") in ("user", "tool"):
-                    data.history.append(_assistant_final(INTERRUPTED_NOTE, mode=mode))
+                    data.history.append(_assistant_final(INTERRUPTED_NOTE))
 
             if _is_retry_request(data.unfinished_turn, text, retry=retry):
                 assert data.unfinished_turn is not None
@@ -341,7 +325,7 @@ class ChatService:
             data.memories = apply_user_memory(data.memories, text)
             try:
                 ctx_plan = build_context(
-                    system_prompt=build_system_prompt(registry, tool_mode=mode),
+                    system_prompt=build_system_prompt(registry),
                     history=data.history,
                     user_input=text,
                     existing_summary=data.summary,
@@ -349,7 +333,7 @@ class ChatService:
                     max_history_turns=self._max_history_turns,
                     max_context_tokens=self._max_context_tokens,
                     reserved_tokens=self._reserved_tokens,
-                    tools_schema=registry.openai_tools() if mode == "native" else None,
+                    tools_schema=registry.openai_tools(),
                     recalled_memories=select_memories(data.memories, text),
                     memory_question=wants_memory_recall(text),
                     session_memories=data.memories,
@@ -361,7 +345,7 @@ class ChatService:
                 )
                 prev_history = list(data.history)
                 prev_unfinished = copy.deepcopy(data.unfinished_turn)
-                messages = [{"role": "user", "content": text}, _assistant_final(ans, mode=mode)]
+                messages = [{"role": "user", "content": text}, _assistant_final(ans)]
                 data.history += messages
                 data.unfinished_turn = {
                     "turn_id": turn_id,
@@ -429,7 +413,7 @@ class ChatService:
                 prev_unfinished = copy.deepcopy(data.unfinished_turn)
                 new_messages = list(cur_messages[prefix_len:])
                 if status != OK:
-                    new_messages.append(_assistant_final(answer, mode=mode))
+                    new_messages.append(_assistant_final(answer))
                     data.unfinished_turn = {
                         "turn_id": turn_id,
                         "attempt": attempt_id,
@@ -454,10 +438,9 @@ class ChatService:
                 self._llm,
                 registry,
                 self._max_steps,
-                self._max_parse_retries,
+                self._max_output_retries,
                 max_context_tokens=self._max_context_tokens,
                 trace_logger=self._trace_logger,
-                tool_mode=self._tool_mode,
                 parallel_tool_calls=self._parallel_tool_calls,
                 tool_timeout=self._tool_timeout,
                 max_concurrency=self._max_concurrency,
@@ -482,7 +465,7 @@ class ChatService:
                     new_messages = partial.messages[prefix_len:]
                 else:
                     new_messages = [{"role": "user", "content": text}]
-                new_messages.append(_assistant_final(INTERRUPTED_NOTE, mode=mode))
+                new_messages.append(_assistant_final(INTERRUPTED_NOTE))
                 data.history = base_history + new_messages
                 data.todos = store.export_state(ctx)
                 data.summary = refresh_summary_todos(data.summary, data.todos)
@@ -501,8 +484,6 @@ class ChatService:
             return result
 
 
-def _assistant_final(text: str, mode: str = "text") -> dict[str, str]:
-    """构造一条 assistant 结束回复消息（native 模式为纯文本，text 模式为 final_answer JSON）。"""
-    if mode == "native":
-        return {"role": "assistant", "content": text}
-    return {"role": "assistant", "content": json.dumps({"final_answer": text}, ensure_ascii=False)}
+def _assistant_final(text: str) -> dict[str, str]:
+    """构造直接文本形式的 assistant 结束回复。"""
+    return {"role": "assistant", "content": text}

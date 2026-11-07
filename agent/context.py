@@ -9,7 +9,6 @@ from typing import Any
 
 from .llm import Message
 from .memory import filter_historical_user_input, strip_memory_declarations
-from .parser import ParseError, extract_json
 
 _OBS_RE = re.compile(r"^Observation \(tool=([^,]+), status=(ok|error|interrupted)\): (.*)$", re.S)
 _TODO_LINE_RE = re.compile(r"^- #(\d+)\s+\[(pending|done|deleted)[^\]]*\]\s+(.*)$")
@@ -18,7 +17,7 @@ DEFAULT_RESERVED_TOKENS = 4000
 DEFAULT_SUMMARY_TOKENS = 2000
 _ABNORMAL_PREFIXES = (
     "已达最大步数",
-    "模型输出格式多次不合法",
+    "模型回答或工具调用多次无效",
     "模型服务暂时不可用",
     "内部错误：",
     "本轮被中断",
@@ -110,11 +109,11 @@ def check_context_budget(
 
 
 def _is_turn_start(msg: Message) -> bool:
-    """判断消息是否为新一轮真实用户输入（排除工具 Observation 与格式错误反馈）。"""
+    """判断消息是否为新一轮真实用户输入（排除运行时校验反馈）。"""
     if msg.get("role") != "user":
         return False
     content = msg.get("content", "")
-    return not content.startswith("Observation (tool=") and not content.startswith("Format error: ")
+    return not content.startswith("Validation error: ")
 
 
 def split_into_turns(history: list[Message]) -> list[list[Message]]:
@@ -130,16 +129,6 @@ def split_into_turns(history: list[Message]) -> list[list[Message]]:
     if current:
         turns.append(current)
     return turns
-
-
-def _strip_assistant_thought(content: str) -> str:
-    """剥离历史 assistant 消息中的 thought 字段，仅保留工具调用或最终答案。"""
-    try:
-        obj = extract_json(content)
-    except ParseError:
-        return content
-    cleaned = {k: v for k, v in obj.items() if k != "thought"}
-    return json.dumps(cleaned, ensure_ascii=False)
 
 
 def sanitize_turn(turn: list[Message], memories: dict[str, str] | None = None) -> list[Message]:
@@ -160,11 +149,11 @@ def sanitize_turn(turn: list[Message], memories: dict[str, str] | None = None) -
             and not msg.get("tool_calls")
             and i + 1 < len(turn)
             and turn[i + 1].get("role") == "user"
-            and turn[i + 1].get("content", "").startswith("Format error: ")
+            and turn[i + 1].get("content", "").startswith("Validation error: ")
         ):
             i += 2
             continue
-        if role == "user" and content.startswith("Format error: "):
+        if role == "user" and content.startswith("Validation error: "):
             i += 1
             continue
         if role == "assistant":
@@ -173,7 +162,7 @@ def sanitize_turn(turn: list[Message], memories: dict[str, str] | None = None) -
                 # 原生工具调用：剥离伴随调用的思考文本 content，完整保留 tool_calls
                 out.append({"role": "assistant", "content": "", "tool_calls": copy.deepcopy(tcs)})
             else:
-                out.append({"role": "assistant", "content": _strip_assistant_thought(content)})
+                out.append({"role": "assistant", "content": content})
         elif role == "tool":
             tool_msg: Message = {
                 "role": "tool",
@@ -503,26 +492,18 @@ def summarize_turns(
     existing_summary: str = "",
     todos: dict[str, Any] | None = None,
 ) -> StructuredSummary:
-    """从旧对话轮次和工具结果（兼容原生 tool_calls/tool 与文本 Observation）中提取结构化摘要，不保留历史 thought。"""
+    """从旧对话轮次和工具结果（原生 tool_calls/tool）中提取结构化摘要，不保留历史 thought。"""
     summary = parse_summary(existing_summary)
     for turn in turns:
         user_text = ""
         final_answer = ""
-        pending_args: dict[str, Any] = {}
         native_calls: dict[str, tuple[str, dict[str, Any]]] = {}
         had_tool_fact = False
 
         for msg in turn:
             role, content = msg.get("role", ""), msg.get("content", "")
             if role == "user":
-                m = _OBS_RE.match(content)
-                if m:
-                    tool, status, payload = m.group(1), m.group(2), m.group(3)
-                    _extract_observation(tool, status, payload, pending_args, summary)
-                    if status == "ok" and tool in ("weather", "calculator", "search"):
-                        had_tool_fact = True
-                    continue
-                if content.startswith("Format error: "):
+                if content.startswith("Validation error: "):
                     continue
                 if not user_text:
                     user_text = strip_memory_declarations(content).strip()
@@ -559,19 +540,7 @@ def summarize_turns(
                             parsed_args = {}
                         native_calls[tc_id] = (t_name, parsed_args if isinstance(parsed_args, dict) else {})
                     continue
-                try:
-                    obj = extract_json(content)
-                except ParseError:
-                    stripped = content.strip()
-                    if stripped and not stripped.startswith("{") and not stripped.startswith("```"):
-                        final_answer = stripped
-                    continue
-                # 历史 thought 不作为长期记忆，此处绝不读取 obj["thought"]
-                if isinstance(obj.get("action"), str):
-                    args = obj.get("action_input")
-                    pending_args = args if isinstance(args, dict) else {}
-                elif isinstance(obj.get("final_answer"), str):
-                    final_answer = obj["final_answer"].strip()
+                final_answer = content.strip()
 
         if final_answer:
             if any(final_answer.startswith(prefix) for prefix in _ABNORMAL_PREFIXES):
